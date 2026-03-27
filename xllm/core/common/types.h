@@ -225,6 +225,7 @@ struct InstanceInfo {
   std::vector<std::pair<int32_t, double>> ttft_profiling_data;
   // tpot profiling data
   std::vector<std::tuple<int32_t, int32_t, double>> tpot_profiling_data;
+  std::vector<double> coefficients;
 
   // XTensor mode: per-worker free physical pages
   std::vector<size_t> worker_free_phy_pages;
@@ -263,6 +264,7 @@ struct InstanceInfo {
     json_val["ports"] = ports;
     json_val["ttft_profiling_data"] = ttft_profiling_data;
     json_val["tpot_profiling_data"] = tpot_profiling_data;
+    json_val["coefficients"] = coefficients;
     // XTensor mode info
     json_val["worker_free_phy_pages"] = worker_free_phy_pages;
     json_val["total_phy_pages"] = total_phy_pages;
