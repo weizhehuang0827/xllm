@@ -36,6 +36,7 @@ class KVCacheManager {
 
   virtual void transfer_blocks(std::vector<Batch>& batches) {};
   virtual void transfer_blocks() {};
+  virtual void enqueue_running_d2h_blocks(Sequence* sequence) {};
 
   virtual void prefetch_from_storage(std::shared_ptr<Request>& request) {};
 

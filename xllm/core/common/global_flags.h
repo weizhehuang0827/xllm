@@ -197,6 +197,8 @@ DECLARE_double(starve_threshold);
 
 DECLARE_bool(enable_starve_prevent);
 
+DECLARE_int32(n_off);
+
 DECLARE_double(host_blocks_factor);
 
 DECLARE_bool(enable_kvcache_store);

@@ -588,6 +588,19 @@ std::vector<Batch> MixScheduler::prepare_batch() {
       (std::all_of(batches.begin(), batches.end(), [](const Batch& one_batch) {
         return one_batch.empty();
       }));
+
+  if (!is_batches_empty && FLAGS_n_off > 0 && enable_prefix_cache_ &&
+      FLAGS_host_blocks_factor > 1.0) {
+    for (const auto& request : running_requests_) {
+      auto& sequence = request->sequences()[0];
+      kv_cache_manager_->enqueue_running_d2h_blocks(sequence.get());
+    }
+    for (const auto& request : running_queue_) {
+      auto& sequence = request->sequences()[0];
+      kv_cache_manager_->enqueue_running_d2h_blocks(sequence.get());
+    }
+  }
+
   if (!is_batches_empty) {
     // only update the scheduling latency when there are requests to process
     COUNTER_ADD(scheduling_latency_seconds, timer.elapsed_seconds());

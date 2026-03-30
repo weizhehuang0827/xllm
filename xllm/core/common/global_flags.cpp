@@ -211,6 +211,13 @@ DEFINE_bool(enable_starve_prevent,
             true,
             "Whether to enable anti-starvation in MixScheduler.");
 
+DEFINE_int32(
+    n_off,
+    0,
+    "Enqueue D2H offload in MixScheduler when a sequence's pending offload "
+    "blocks (device-host cached blocks) reach n_off. "
+    "Set to 0 to disable.");
+
 // for rec, it's better to set to 100;
 DEFINE_int32(request_queue_size,
              100000,

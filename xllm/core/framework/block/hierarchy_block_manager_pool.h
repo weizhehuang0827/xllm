@@ -24,17 +24,30 @@ namespace xllm {
 class Engine;
 
 struct OffloadBlockPair {
-  OffloadBlockPair(Block& s, Block& d) : src(s), dst(d) {}
+  OffloadBlockPair(Block& s,
+                   Block& d,
+                   bool release_blocks_after_transfer_ = true)
+      : src(s),
+        dst(d),
+        release_blocks_after_transfer(release_blocks_after_transfer_) {}
 
-  OffloadBlockPair(Block&& s, Block&& d)
-      : src(std::move(s)), dst(std::move(d)) {}
+  OffloadBlockPair(Block&& s,
+                   Block&& d,
+                   bool release_blocks_after_transfer_ = true)
+      : src(std::move(s)),
+        dst(std::move(d)),
+        release_blocks_after_transfer(release_blocks_after_transfer_) {}
 
-  OffloadBlockPair(Block& s) : src(s) {}
+  OffloadBlockPair(Block& s, bool release_blocks_after_transfer_ = true)
+      : src(s), release_blocks_after_transfer(release_blocks_after_transfer_) {}
 
-  OffloadBlockPair(Block&& s) : src(std::move(s)) {}
+  OffloadBlockPair(Block&& s, bool release_blocks_after_transfer_ = true)
+      : src(std::move(s)),
+        release_blocks_after_transfer(release_blocks_after_transfer_) {}
 
   Block src;
   Block dst;
+  bool release_blocks_after_transfer = true;
 };
 
 class HierarchyBlockManagerPool : public BlockManagerPool {
@@ -57,6 +70,7 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   void allocate_shared(Sequence* sequence) override;
 
   void deallocate(Sequence* sequence) override;
+  void enqueue_running_d2h_blocks(Sequence* sequence) override;
 
   void transfer_blocks(std::vector<Batch>& batches) override;
   void transfer_blocks() override;

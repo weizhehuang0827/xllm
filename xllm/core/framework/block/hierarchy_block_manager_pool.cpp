@@ -16,6 +16,7 @@ limitations under the License.
 #include "hierarchy_block_manager_pool.h"
 
 #include "block_manager_impl.h"
+#include "common/global_flags.h"
 #include "concurrent_block_manager_impl.h"
 
 namespace xllm {
@@ -59,18 +60,19 @@ void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
   auto* blocks = sequence->kv_state().mutable_kv_blocks();
   auto* host_blocks = sequence->host_kv_state().mutable_kv_blocks();
 
-  if (host_blocks->size() >= blocks->size()) {
+  size_t cached_host_block_num =
+      sequence->host_kv_state().kv_cache_tokens_num() / options_.block_size();
+  size_t cached_device_block_num =
+      sequence->kv_state().kv_cache_tokens_num() / options_.block_size();
+
+  if (host_blocks->size() >= blocks->size() &&
+      cached_host_block_num >= cached_device_block_num) {
     host_block_managers_[dp_rank]->deallocate(
         sequence->host_kv_state().kv_blocks());
     block_managers_[dp_rank]->deallocate(sequence->kv_state().kv_blocks());
     sequence->reset();
     return;
   }
-
-  size_t cached_host_block_num =
-      sequence->host_kv_state().kv_cache_tokens_num() / options_.block_size();
-  size_t cached_device_block_num =
-      sequence->kv_state().kv_cache_tokens_num() / options_.block_size();
 
   size_t needed_block_num = cached_device_block_num > host_blocks->size()
                                 ? cached_device_block_num - host_blocks->size()
@@ -82,14 +84,18 @@ void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
         host_block_managers_[dp_rank]->allocate(needed_block_num));
   }
 
-  for (size_t i = cached_host_block_num; i < host_blocks->size(); i++) {
+  size_t offload_end = std::min(cached_device_block_num, host_blocks->size());
+  offload_end = std::min(offload_end, blocks->size());
+  for (size_t i = cached_host_block_num; i < offload_end; i++) {
     if (blocks->at(i).ref_count() != 2) {
       continue;
     }
 
     host_blocks->at(i).set_hash_value(blocks->at(i).get_immutable_hash_value());
     auto block_pair = std::make_shared<OffloadBlockPair>(
-        std::move(blocks->at(i)), std::move(host_blocks->at(i)));
+        std::move(blocks->at(i)),
+        std::move(host_blocks->at(i)),
+        /*release_blocks_after_transfer_=*/true);
     offload_block_pair_queues_[dp_rank].enqueue(std::move(block_pair));
   }
 
@@ -98,6 +104,71 @@ void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
 
   block_managers_[dp_rank]->deallocate(sequence->kv_state().kv_blocks());
   sequence->reset();
+}
+
+void HierarchyBlockManagerPool::enqueue_running_d2h_blocks(Sequence* sequence) {
+  DCHECK(sequence != nullptr);
+
+  // Running D2H offload is only enabled when prefix cache is on and
+  // host capacity is expanded (host_blocks_factor > 1).
+  if (!options_.enable_prefix_cache() ||
+      options_.host_num_blocks() <= options_.num_blocks()) {
+    return;
+  }
+
+  // Keep pure prefill behavior unchanged; allow CHUNKED_PREFILL to offload.
+  if (sequence->stage() == SequenceStage::PREFILL) {
+    return;
+  }
+
+  int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
+  auto* blocks = sequence->kv_state().mutable_kv_blocks();
+  auto* host_blocks = sequence->host_kv_state().mutable_kv_blocks();
+
+  if (blocks->empty()) {
+    return;
+  }
+
+  size_t cached_host_block_num =
+      sequence->host_kv_state().kv_cache_tokens_num() / options_.block_size();
+  size_t cached_device_block_num =
+      sequence->kv_state().kv_cache_tokens_num() / options_.block_size();
+  if (cached_device_block_num <= cached_host_block_num) {
+    return;
+  }
+  const size_t needed_offload_num =
+      cached_device_block_num - cached_host_block_num;
+  if (FLAGS_n_off > 0 &&
+      needed_offload_num < static_cast<size_t>(FLAGS_n_off)) {
+    return;
+  }
+
+  if (host_blocks->size() < cached_device_block_num) {
+    const size_t needed_block_num =
+        cached_device_block_num - host_blocks->size();
+    sequence->host_kv_state().add_kv_blocks(
+        host_block_managers_[dp_rank]->allocate(needed_block_num));
+  }
+
+  size_t offload_end = std::min(cached_device_block_num, host_blocks->size());
+  offload_end = std::min(offload_end, blocks->size());
+  if (offload_end <= cached_host_block_num) {
+    return;
+  }
+
+  for (size_t i = cached_host_block_num; i < offload_end; i++) {
+    host_blocks->at(i).set_hash_value(blocks->at(i).get_immutable_hash_value());
+    auto block_pair = std::make_shared<OffloadBlockPair>(
+        blocks->at(i),
+        host_blocks->at(i),
+        /*release_blocks_after_transfer_=*/false);
+    offload_block_pair_queues_[dp_rank].enqueue(std::move(block_pair));
+  }
+
+  const size_t host_cache_tokens_num = offload_end * options_.block_size();
+  if (sequence->host_kv_state().kv_cache_tokens_num() < host_cache_tokens_num) {
+    sequence->host_kv_state().set_kv_cache_tokens_num(host_cache_tokens_num);
+  }
 }
 
 bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
@@ -307,28 +378,41 @@ void HierarchyBlockManagerPool::transfer_blocks(std::vector<Batch>& batches) {
 void HierarchyBlockManagerPool::transfer_blocks() {
   // offload blocks from device to host and kvcache store
   for (int i = 0; i < offload_block_pair_queues_.size(); i++) {
-    std::vector<BlockTransferInfo> transfer_infos;
-    std::vector<Block> src_blocks;
-    std::vector<Block> dst_blocks;
+    std::vector<BlockTransferInfo> release_transfer_infos;
+    std::vector<Block> release_src_blocks;
+    std::vector<Block> release_dst_blocks;
+    std::vector<BlockTransferInfo> keep_transfer_infos;
+    std::vector<Block> keep_src_blocks;
+    std::vector<Block> keep_dst_blocks;
 
     std::shared_ptr<OffloadBlockPair> block_pair;
     while (offload_block_pair_queues_[i].try_dequeue(block_pair)) {
-      src_blocks.emplace_back(std::move(block_pair->src));
-      dst_blocks.emplace_back(std::move(block_pair->dst));
-      transfer_infos.emplace_back(
-          BlockTransferInfo(src_blocks.back().id(),
-                            dst_blocks.back().id(),
-                            dst_blocks.back().get_immutable_hash_value(),
-                            TransferType::D2G));
+      if (block_pair->release_blocks_after_transfer) {
+        release_src_blocks.emplace_back(std::move(block_pair->src));
+        release_dst_blocks.emplace_back(std::move(block_pair->dst));
+        release_transfer_infos.emplace_back(BlockTransferInfo(
+            release_src_blocks.back().id(),
+            release_dst_blocks.back().id(),
+            release_dst_blocks.back().get_immutable_hash_value(),
+            TransferType::D2G));
+      } else {
+        keep_src_blocks.emplace_back(std::move(block_pair->src));
+        keep_dst_blocks.emplace_back(std::move(block_pair->dst));
+        keep_transfer_infos.emplace_back(
+            BlockTransferInfo(keep_src_blocks.back().id(),
+                              keep_dst_blocks.back().id(),
+                              keep_dst_blocks.back().get_immutable_hash_value(),
+                              TransferType::D2G));
+      }
       block_pair.reset();
     }
 
-    if (!transfer_infos.empty()) {
-      folly::collectAll(
-          std::move(engine_->transfer_kv_blocks(i, std::move(transfer_infos))))
+    if (!release_transfer_infos.empty()) {
+      folly::collectAll(std::move(engine_->transfer_kv_blocks(
+                            i, std::move(release_transfer_infos))))
           .via(folly::getGlobalCPUExecutor())
-          .thenValue([device_blocks = std::move(src_blocks),
-                      host_blocks = std::move(dst_blocks),
+          .thenValue([device_blocks = std::move(release_src_blocks),
+                      host_blocks = std::move(release_dst_blocks),
                       device_block_mgr_ptr = block_managers_[i].get(),
                       host_block_mgr_ptr = host_block_managers_[i].get()](
                          std::vector<folly::Try<uint32_t>>&& results) mutable {
@@ -346,6 +430,28 @@ void HierarchyBlockManagerPool::transfer_blocks() {
             host_block_mgr_ptr->deallocate({host_blocks});
             host_blocks.clear();
 
+            return 0;
+          });
+    }
+
+    if (!keep_transfer_infos.empty()) {
+      folly::collectAll(std::move(engine_->transfer_kv_blocks(
+                            i, std::move(keep_transfer_infos))))
+          .via(folly::getGlobalCPUExecutor())
+          .thenValue([device_blocks = std::move(keep_src_blocks),
+                      host_blocks = std::move(keep_dst_blocks),
+                      host_block_mgr_ptr = host_block_managers_[i].get()](
+                         std::vector<folly::Try<uint32_t>>&& results) mutable {
+            for (auto&& result : results) {
+              if (result.value() != host_blocks.size()) {
+                LOG(FATAL) << "Offload copy fail, expected "
+                           << host_blocks.size() << ", got " << result.value();
+              }
+            }
+
+            host_block_mgr_ptr->cache(host_blocks);
+            device_blocks.clear();
+            host_blocks.clear();
             return 0;
           });
     }
