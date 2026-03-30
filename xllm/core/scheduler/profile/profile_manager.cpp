@@ -19,6 +19,8 @@ limitations under the License.
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -519,8 +521,10 @@ ProfileManager::get_copy_block_profile() {
   // NOTE: Add more model profiles here
   static const std::vector<CopyBlockProfile> profiles = {
       // offline copy block profile
-      {"Qwen2-7B", 128, 0.48, 0.24, "Qwen2-7B, block_size=128"},
-      {"Qwen2-7B", 64, 0.20, 0.25, "Qwen2-7B, block_size=128"},
+      {"Qwen2-7B", 128, -1, 0.48, 0.24, "Qwen2-7B, block_size=128"},
+      {"Qwen2-7B", 64, -1, 0.20, 0.25, "Qwen2-7B, block_size=64"},
+      {"Qwen3-32B", 64, 2, 0.972, 0.14, "Qwen3-32B, block_size=64, tp=2"},
+      {"Qwen3-32B", 64, 4, 0.588, 0.14, "Qwen3-32B, block_size=64, tp=4"},
   };
 
   return profiles;
@@ -528,23 +532,39 @@ ProfileManager::get_copy_block_profile() {
 
 const ProfileManager::CopyBlockProfile* ProfileManager::find_profile(
     const std::string& model_name,
-    int32_t block_size) const {
+    int32_t block_size,
+    int32_t tp_size) const {
+  auto to_lower = [](const std::string& input) {
+    std::string output = input;
+    std::transform(
+        output.begin(), output.end(), output.begin(), [](unsigned char c) {
+          return std::tolower(c);
+        });
+    return output;
+  };
+  const std::string model_name_lower = to_lower(model_name);
   const auto& profiles = get_copy_block_profile();
   for (const auto& profile : profiles) {
-    if ((profile.model_name == model_name ||
-         model_name.find(profile.model_name) != std::string::npos) &&
-        profile.block_size == block_size) {
+    const std::string profile_name_lower = to_lower(profile.model_name);
+    const bool match_model =
+        (profile_name_lower == model_name_lower) ||
+        (model_name_lower.find(profile_name_lower) != std::string::npos);
+    const bool match_tp = (profile.tp_size <= 0 || profile.tp_size == tp_size);
+    if (match_model && profile.block_size == block_size && match_tp) {
       return &profile;
     }
   }
   LOG(ERROR) << "No profile found for " << model_name
-             << " with block_size=" << block_size << ", using default values";
+             << " with block_size=" << block_size << ", tp_size=" << tp_size
+             << ", using default values";
   return nullptr;
 }
 
 int32_t ProfileManager::get_max_copy_block_num(double latency_budget) {
   auto block_size = block_manager_pool_->options().block_size();
-  const CopyBlockProfile* profile = find_profile(FLAGS_model_id, block_size);
+  const int32_t tp_size = std::max(options_.tp_size(), 1);
+  const CopyBlockProfile* profile =
+      find_profile(FLAGS_model_id, block_size, tp_size);
 
   double a = 1, b = 0;  // default values
   if (profile) {
@@ -560,7 +580,9 @@ double ProfileManager::predict_copy_blocks_time(
     size_t num_copy_blocks,
     bool if_need_add_constant_term) {
   auto block_size = block_manager_pool_->options().block_size();
-  const CopyBlockProfile* profile = find_profile(FLAGS_model_id, block_size);
+  const int32_t tp_size = std::max(options_.tp_size(), 1);
+  const CopyBlockProfile* profile =
+      find_profile(FLAGS_model_id, block_size, tp_size);
 
   double a = 1, b = 0;  // default values
   if (profile) {

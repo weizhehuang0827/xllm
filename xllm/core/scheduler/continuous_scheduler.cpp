@@ -90,7 +90,9 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
   last_batch_.resize(options_.dp_size());
 
   ProfileManager::Options profile_manager_options;
+  const int32_t tp_size = options.nnodes() > 0 ? options.nnodes() : 1;
   profile_manager_options.dp_size(options.dp_size())
+      .tp_size(tp_size)
       .enable_schedule_overlap(options.enable_schedule_overlap())
       .enable_profile_step_time(options.enable_profile_step_time())
       .profile_max_prompt_length(options.profile_max_prompt_length())

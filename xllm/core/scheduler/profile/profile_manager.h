@@ -35,6 +35,9 @@ class ProfileManager {
     PROPERTY(bool, enable_schedule_overlap) = false;
 
     PROPERTY(int32_t, dp_size) = 1;
+
+    // world size when only TP is enabled.
+    PROPERTY(int32_t, tp_size) = 1;
     // config for profile
     PROPERTY(bool, enable_profile_step_time) = false;
 
@@ -55,6 +58,7 @@ class ProfileManager {
   struct CopyBlockProfile {
     std::string model_name;
     int block_size;
+    int tp_size;       // <=0 means any tp size
     double slope;      // milliseconds per block
     double intercept;  // milliseconds constant overhead
     std::string note;
@@ -161,7 +165,8 @@ class ProfileManager {
 
   const ProfileManager::CopyBlockProfile* find_profile(
       const std::string& model_name,
-      int block_size) const;
+      int block_size,
+      int tp_size) const;
 
   std::unique_ptr<TimePredictor> prefill_time_predictor_;
   std::unique_ptr<TimePredictor> decode_time_predictor_;
