@@ -101,6 +101,8 @@ class ContinuousScheduler : public Scheduler {
     // use predicted latency for latency aware schedule
     PROPERTY(bool, enable_profile_token_budget) = false;
 
+    PROPERTY(bool, profile_h2d_time) = false;
+
     PROPERTY(bool, enable_latency_aware_schedule) = false;
     // the max prompt length for profile
     PROPERTY(int32_t, profile_max_prompt_length) = 2048;

@@ -37,7 +37,13 @@ class KVCacheManager {
   virtual void transfer_blocks(std::vector<Batch>& batches) {};
   virtual void transfer_blocks() {};
 
-  virtual void prefetch_from_storage(std::shared_ptr<Request>& request) {};
+  virtual void transfer_host_block_only() {
+    return;
+  };
+
+  virtual void prefetch_from_storage(std::shared_ptr<Request>& request) {
+    return;
+  };
 
   virtual bool update_prefetch_result(std::shared_ptr<Request>& request,
                                       const uint32_t timeout) {

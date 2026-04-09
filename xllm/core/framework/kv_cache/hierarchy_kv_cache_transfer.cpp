@@ -321,6 +321,8 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
   void** dsts = new void*[num_batches * layers_per_bacth_copy];
   size_t* copy_size = new size_t[num_batches * layers_per_bacth_copy];
 
+  double latency_sum = 0.0;
+
   for (int index = 0; index < copy_cnt; index++) {
     int layer_id = index * layers_per_bacth_copy;
     size_t fail_index = 0;
@@ -362,6 +364,8 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
       layer_cnt++;
     }
 
+    absl::Time start_time = absl::Now();
+
     ret = aclrtMemcpyBatch(dsts,
                            copy_size,
                            srcs,
@@ -371,6 +375,13 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
                            attrs_indexes,
                            1,
                            &fail_index);
+    
+    double latency = absl::ToDoubleMilliseconds(absl::Now() - start_time);
+    latency_sum += latency;
+    LOG(INFO) << "H2D batch copy layer " << index
+              << ", layers: " << layer_cnt
+              << ", blocks: " << block_transfer_info.size()
+              << ", latency(ms): " << latency;
 
     if (ret != 0 || fail_index != SIZE_MAX) {
       LOG(ERROR) << "aclrtMemcpyBatch error: " << ret
@@ -392,6 +403,8 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
     copy_stream_.enqueue(std::move(stream));
     return false;
   }
+
+  LOG(INFO) << "H2D batch:" << batch_id << " copy total latency(ms): " << latency_sum;
 
   copy_stream_.enqueue(std::move(stream));
 

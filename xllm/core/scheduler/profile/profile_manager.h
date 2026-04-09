@@ -40,6 +40,8 @@ class ProfileManager {
 
     PROPERTY(bool, enable_profile_token_budget) = false;
 
+    PROPERTY(bool, profile_h2d_time) = false;
+
     PROPERTY(int32_t, profile_max_prompt_length) = 2048;
 
     PROPERTY(bool, enable_profile_kv_blocks) = true;
@@ -116,6 +118,14 @@ class ProfileManager {
   std::vector<double> get_coefficients(bool is_prefill = true);
 
   void profile_step_time(bool if_dump_to_file);
+
+  void profile_swap_time();
+
+
+  double run_copy_in_blocks(int32_t token_length,
+                                   int32_t prefix_length,
+                                   int32_t batch_size,
+                                   int32_t extra_token_length);
 
  private:
   void dump_step_time_profile_to_file(

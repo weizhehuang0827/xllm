@@ -18,6 +18,8 @@ limitations under the License.
 #include "block_manager_pool.h"
 #include "distributed_runtime/engine.h"
 #include "util/blockingconcurrentqueue.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 
 namespace xllm {
 
@@ -67,6 +69,8 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
                               const uint32_t timeout) override;
 
   void get_merged_kvcache_event(KvCacheEvent* event) const override;
+
+  void transfer_host_block_only();
 
  private:
   void allocate_host_shared(Sequence* sequence);

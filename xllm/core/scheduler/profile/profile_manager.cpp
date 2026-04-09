@@ -67,8 +67,16 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
     }
   }
 #endif
+
+  if (options.profile_h2d_time()) {
+    profile_swap_time();
+  }
 }
 
+void ProfileManager::profile_swap_time() {
+  block_manager_pool_->transfer_host_block_only();
+}
+    
 // --------------------- for test only ---------------------------
 void ProfileManager::eval_sequence_latency_prediction() {
   std::vector<double> pred_vec;
@@ -617,6 +625,61 @@ std::shared_ptr<Request> ProfileManager::generate_single_request(
 
   return request;
 }
+
+// std::shared_ptr<Request> ProfileManager::generate_single_cached_request(
+//     int32_t token_length,
+//     int32_t prefix_length) {
+//   auto& model_args = engine_->model_args();
+//   int32_t vocab_size = model_args.vocab_size();
+//   int32_t eos_token_id = model_args.eos_token_id();
+
+//   std::random_device rd;
+//   std::mt19937_64 gen(rd());
+
+//   // If req_state does not initialize the stopchecker, default eos_token_id = 0,
+//   // need to skip it
+//   std::uniform_int_distribution<int32_t> dis(1, vocab_size - 2);
+
+//   std::vector<int32_t> token_ids(token_length);
+//   std::generate(token_ids.begin(), token_ids.end(), [&]() {
+//     int32_t token = dis(gen);
+//     return token == eos_token_id ? token + 1 : token;  // skip eos
+//   });
+
+//   RequestState req_state(token_ids);
+//   auto request = std::make_shared<Request>(
+//       /*request_id=*/"",
+//       /*x_request_id=*/"",
+//       /*x_request_time=*/"",
+//       req_state);
+
+//   // TODO: better disable prefix cache
+//   if (prefix_length > 0) {
+//     if (!block_manager_pool_->allocate(request->sequences()[0].get(),
+//                                        prefix_length)) {
+//       LOG(FATAL) << "Profiling time failed! Not enough blocks, prefix length : "
+//                  << prefix_length;
+//     }
+//     // offload kv cache blocks for device prefix and host prefix
+//     if (!block_manager_pool_->deallocate(request.get())) {
+//       LOG(FATAL) << "Profiling time failed! can not deallocate : "
+//                  << prefix_length;
+//     }
+//     if (!block_manager_pool_->allocate(request->sequences()[0].get(),
+//                                        prefix_length)) {
+//       LOG(FATAL) << "Profiling time failed! Not enough blocks, prefix length : "
+//                  << prefix_length;
+//     }
+//     request->sequences()[0]->kv_state().incr_kv_cache_tokens_num(prefix_length);
+//   }
+
+//   if (!block_manager_pool_->allocate(request->sequences()[0].get())) {
+//     LOG(FATAL) << "Profiling time failed! Not enough blocks, token length : "
+//                << token_length;
+//   }
+
+//   return request;
+// }
 
 // collect the latency of each step
 double ProfileManager::run_request(int32_t token_length,

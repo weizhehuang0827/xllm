@@ -363,4 +363,37 @@ void HierarchyBlockManagerPool::get_merged_kvcache_event(
   }
 }
 
+// for profile swap time only
+void HierarchyBlockManagerPool::transfer_host_block_only() {
+  
+  // load_block_transfer_infos_[dp_rank].emplace_back(
+  //         BlockTransferInfo(host_blocks[i].id(),
+  //                           hbm_blocks[i].id(),
+  //                           host_blocks[i].get_immutable_hash_value(),
+  //                           TransferType::H2D));
+
+  
+  uint8_t buffer[XXH3_128BITS_HASH_VALUE_LEN] = {0};
+  for  (int i = 4; i <= 400; i = i + 4){
+  // for  (int i = 2; i <= 40; i = i + 2){
+    std::vector<BlockTransferInfo> transfer_infos;
+    int32_t transfer_block_num = i;
+    for (int j = 0; j < transfer_block_num; j++) {
+      int32_t block_id = j;
+      transfer_infos.emplace_back(
+          BlockTransferInfo(block_id,
+                            block_id,
+                            buffer,
+                            TransferType::H2D));
+    }
+    int32_t batch_id = i;
+    engine_->transfer_kv_blocks(0, batch_id, std::move(transfer_infos));
+    absl::SleepFor(absl::Milliseconds(1000));
+  }
+
+  // engine_->transfer_kv_blocks(i, batches->at(i).batch_id(),
+  //                                   std::move(load_block_transfer_infos_[i]));
+
+}
+
 }  // namespace xllm

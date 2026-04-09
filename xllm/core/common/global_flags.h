@@ -219,6 +219,8 @@ DECLARE_bool(enable_profile_step_time);
 
 DECLARE_bool(enable_profile_token_budget);
 
+DECLARE_bool(profile_h2d_time);
+
 DECLARE_bool(enable_latency_aware_schedule);
 
 DECLARE_int32(profile_max_prompt_length);

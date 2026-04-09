@@ -253,6 +253,8 @@ DEFINE_bool(enable_profile_token_budget,
             false,
             "Whether to enable profile token budget.");
 
+DEFINE_bool(profile_h2d_time, false, "Whether to enable H2D copy time profiling.");
+
 DEFINE_bool(enable_latency_aware_schedule,
             false,
             "use predicted latency for latency aware schedule.");
