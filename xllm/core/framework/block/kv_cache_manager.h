@@ -37,7 +37,7 @@ class KVCacheManager {
   virtual void transfer_blocks(std::vector<Batch>& batches) {};
   virtual void transfer_blocks() {};
 
-  virtual void transfer_host_block_only() {
+  virtual void transfer_host_block_only(bool profile_with_d2h = false) {
     return;
   };
 

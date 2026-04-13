@@ -74,7 +74,8 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
 }
 
 void ProfileManager::profile_swap_time() {
-  block_manager_pool_->transfer_host_block_only();
+  block_manager_pool_->transfer_host_block_only(
+      options_.profile_h2d_time_with_d2h());
 }
     
 // --------------------- for test only ---------------------------

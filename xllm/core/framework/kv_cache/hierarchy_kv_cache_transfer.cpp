@@ -246,6 +246,7 @@ bool HierarchyKVCacheTransfer::d2h_batch_copy(
   c10::StreamGuard streamGuard = stream->set_stream_guard();
 
   // TODO(kangmeng): change to async API
+  absl::Time start_time = absl::Now();
   aclError ret = aclrtMemcpyBatch(dsts,
                                   copy_size,
                                   srcs,
@@ -255,6 +256,9 @@ bool HierarchyKVCacheTransfer::d2h_batch_copy(
                                   attrs_indexes,
                                   1,
                                   &fail_index);
+  double latency = absl::ToDoubleMilliseconds(absl::Now() - start_time);
+  LOG(INFO) << "D2H batch copy blocks: " << block_transfer_info.size()
+            << ", latency(ms): " << latency;
   if (ret != 0 || fail_index != SIZE_MAX) {
     LOG(ERROR) << "aclrtMemcpyBatch error: " << ret
                << ", fail_index:" << fail_index;

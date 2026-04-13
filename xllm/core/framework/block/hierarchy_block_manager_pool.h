@@ -70,7 +70,7 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
 
   void get_merged_kvcache_event(KvCacheEvent* event) const override;
 
-  void transfer_host_block_only();
+  void transfer_host_block_only(bool profile_with_d2h = false);
 
  private:
   void allocate_host_shared(Sequence* sequence);

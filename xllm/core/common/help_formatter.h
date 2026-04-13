@@ -107,6 +107,7 @@ const OptionCategory kOtherOptions = {
      "num_response_handling_threads",
      "prefill_scheduling_memory_usage_threshold",
      "profile_h2d_time",
+     "profile_h2d_time_with_d2h",
      "use_contiguous_input_buffer",
      "use_audio_in_video"}};
 

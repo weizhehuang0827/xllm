@@ -42,6 +42,8 @@ class ProfileManager {
 
     PROPERTY(bool, profile_h2d_time) = false;
 
+    PROPERTY(bool, profile_h2d_time_with_d2h) = false;
+
     PROPERTY(int32_t, profile_max_prompt_length) = 2048;
 
     PROPERTY(bool, enable_profile_kv_blocks) = true;
