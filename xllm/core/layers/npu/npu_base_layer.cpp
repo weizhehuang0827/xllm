@@ -124,7 +124,6 @@ atb::Status BaseLayer::execute_plan(const atb_speed::Model::Node& node,
   LOG_IF(ERROR, st != 0) << name_ << " execute plan fail, error code: " << st;
   if (st == 0 && event != nullptr) {
     aclrtStream stream = context_->GetExecuteStream();
-
     aclrtEvent* aclrt_event = reinterpret_cast<aclrtEvent*>(event);
 
     auto ret = aclrtRecordEvent(*aclrt_event, stream);

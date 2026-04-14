@@ -444,6 +444,24 @@ DEFINE_uint32(prefetch_bacth_size,
 
 DEFINE_uint32(layers_wise_copy_batchs, 4, "Layer wise H2D copy batchs.");
 
+DEFINE_bool(enable_h2d_overlap_profile,
+            false,
+            "Enable lightweight profiling for H2D/compute overlap.");
+
+DEFINE_int32(h2d_overlap_profile_log_interval,
+             200,
+             "When H2D overlap profiling is enabled, print one summary every N "
+             "batches.");
+
+DEFINE_bool(enable_layer_exec_profile,
+            false,
+            "Enable lightweight per-layer execution interval profiling.");
+
+DEFINE_int32(layer_exec_profile_log_interval,
+             200,
+             "When layer execution profiling is enabled, print one summary "
+             "every N batches.");
+
 DEFINE_double(host_blocks_factor,
               0.0,
               "Host block factor, e.g. host block num = host_blocks_factor * "

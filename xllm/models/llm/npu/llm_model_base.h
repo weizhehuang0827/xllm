@@ -20,7 +20,15 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <iomanip>
+#include <limits>
 #include <memory>
+#include <mutex>
+#include <queue>
+#include <sstream>
 #include <string>
 #include <typeinfo>
 #include <vector>
@@ -36,6 +44,7 @@ limitations under the License.
 #include "core/layers/npu/loader/base_manual_loader.h"
 #include "core/layers/npu/loader/rolling_load_manager.h"
 #include "core/layers/npu/loader/rolling_weight_buffer.h"
+#include "core/layers/npu/npu_base_layer.h"
 #include "core/layers/npu/npu_block_copy_impl.h"
 #include "core/layers/npu/npu_lm_head_impl.h"
 #include "core/layers/npu/npu_pos_embedding_impl.h"
@@ -45,6 +54,35 @@ limitations under the License.
 #include "xllm_atb_layers/core/include/atb_speed/log.h"
 
 namespace xllm {
+
+namespace {
+std::atomic<int64_t> g_layer_exec_profiled_batches{0};
+std::atomic<int64_t> g_layer_exec_profiled_exec_us{0};
+std::atomic<int64_t> g_layer_exec_profiled_interval_us{0};
+std::atomic<int64_t> g_layer_exec_profiled_chunk_exec_us{0};
+std::atomic<int64_t> g_layer_exec_profiled_chunk_idle_us{0};
+std::atomic<int64_t> g_layer_exec_profiled_chunk_count{0};
+std::atomic<int64_t> g_layer_exec_profiled_chunk_nonzero_count{0};
+std::atomic<int64_t> g_layer_exec_profiled_chunk_idle_us_max{0};
+std::atomic<int64_t> g_layer_exec_profiled_all_chunk_idle_us_max{0};
+std::mutex g_layer_exec_profiled_chunk_totals_mutex;
+std::vector<int64_t> g_layer_exec_profiled_chunk_idle_us_sum_list;
+std::vector<int64_t> g_layer_exec_profiled_chunk_sample_count_list;
+std::vector<int64_t> g_layer_exec_profiled_chunk_idle_us_max_list;
+std::vector<std::priority_queue<int64_t>>
+    g_layer_exec_profiled_chunk_idle_lower_heaps;
+std::vector<
+    std::priority_queue<int64_t, std::vector<int64_t>, std::greater<int64_t>>>
+    g_layer_exec_profiled_chunk_idle_upper_heaps;
+std::mutex g_layer_exec_profiled_batch_idle_median_mutex;
+std::priority_queue<int64_t> g_layer_exec_profiled_batch_idle_lower;
+std::priority_queue<int64_t, std::vector<int64_t>, std::greater<int64_t>>
+    g_layer_exec_profiled_batch_idle_upper;
+std::mutex g_layer_exec_profiled_all_chunk_idle_median_mutex;
+std::priority_queue<int64_t> g_layer_exec_profiled_all_chunk_idle_lower;
+std::priority_queue<int64_t, std::vector<int64_t>, std::greater<int64_t>>
+    g_layer_exec_profiled_all_chunk_idle_upper;
+}  // namespace
 
 template <typename DecoderType>
 class LlmDecoderLayerImplBase : public torch::nn::Module {
@@ -223,6 +261,109 @@ class LlmModelImplBase : public torch::nn::Module {
 
     RollingLayerGuard rolling_guard(rolling_mgr_);
 
+    const bool enable_layer_exec_profile = FLAGS_enable_layer_exec_profile;
+    const auto batch_profile_start = std::chrono::steady_clock::now();
+    auto prev_layer_end = batch_profile_start;
+    std::vector<int64_t> layer_exec_us_list;
+    std::vector<int64_t> layer_interval_us_list;
+    std::vector<int64_t> chunk_exec_us_list;
+    std::vector<int64_t> chunk_idle_us_list;
+    int64_t batch_exec_us = 0;
+    int64_t batch_interval_us = 0;
+    int64_t batch_chunk_exec_us = 0;
+    int64_t batch_chunk_idle_us = 0;
+    int64_t batch_chunk_count = 0;
+    int64_t batch_chunk_nonzero_count = 0;
+    int64_t max_layer_exec_us = 0;
+    int64_t max_layer_interval_us = 0;
+    int64_t max_chunk_exec_us = 0;
+    int64_t max_chunk_idle_us = 0;
+    int64_t max_layer_exec_idx = -1;
+    int64_t max_layer_interval_idx = -1;
+    int64_t max_chunk_exec_idx = -1;
+    int64_t max_chunk_idle_idx = -1;
+    uint32_t chunk_layers = 0;
+
+#if defined(USE_NPU)
+    bool enable_compute_chunk_profile = false;
+    aclrtStream compute_stream = nullptr;
+    aclrtEvent batch_anchor_event = nullptr;
+    std::vector<aclrtEvent> chunk_start_events;
+    std::vector<aclrtEvent> chunk_end_events;
+    auto destroy_event = [](aclrtEvent& event) {
+      if (event != nullptr) {
+        aclrtDestroyEvent(event);
+        event = nullptr;
+      }
+    };
+    auto cleanup_chunk_events = [&]() {
+      destroy_event(batch_anchor_event);
+      for (auto& event : chunk_start_events) {
+        destroy_event(event);
+      }
+      for (auto& event : chunk_end_events) {
+        destroy_event(event);
+      }
+    };
+    bool chunk_profile_record_error_logged = false;
+    bool chunk_profile_elapsed_error_logged = false;
+#endif
+
+    if (enable_layer_exec_profile) {
+      layer_exec_us_list.assign(layers_.size(), 0);
+      layer_interval_us_list.assign(layers_.size(), 0);
+      // Use FLAGS_layers_wise_copy_batchs as target chunk count, then derive
+      // layers per chunk by dividing hidden-layer count by that chunk count.
+      const uint32_t target_chunk_count =
+          std::max<uint32_t>(1, FLAGS_layers_wise_copy_batchs);
+      chunk_layers = layers_.size() / target_chunk_count;
+      if (chunk_layers == 0) {
+        chunk_layers = 1;
+      }
+      const size_t chunk_count =
+          (layers_.size() + chunk_layers - 1) / chunk_layers;
+      chunk_exec_us_list.assign(chunk_count, 0);
+      chunk_idle_us_list.assign(chunk_count, 0);
+
+#if defined(USE_NPU)
+      if (chunk_count > 0) {
+        compute_stream =
+            c10_npu::getCurrentNPUStream(h.device().index()).stream();
+        chunk_start_events.assign(chunk_count, nullptr);
+        chunk_end_events.assign(chunk_count, nullptr);
+        bool create_success = true;
+        if (aclrtCreateEvent(&batch_anchor_event) != ACL_SUCCESS) {
+          create_success = false;
+        }
+        for (size_t chunk_idx = 0; create_success && chunk_idx < chunk_count;
+             ++chunk_idx) {
+          if (aclrtCreateEvent(&chunk_start_events[chunk_idx]) != ACL_SUCCESS) {
+            create_success = false;
+            break;
+          }
+          if (aclrtCreateEvent(&chunk_end_events[chunk_idx]) != ACL_SUCCESS) {
+            create_success = false;
+            break;
+          }
+        }
+        aclError anchor_ret = ACL_ERROR_NONE;
+        if (create_success) {
+          anchor_ret = aclrtRecordEvent(batch_anchor_event, compute_stream);
+        }
+        if (create_success && anchor_ret == ACL_SUCCESS) {
+          enable_compute_chunk_profile = true;
+        } else {
+          cleanup_chunk_events();
+          LOG(WARNING) << "Failed to initialize chunk compute stream profile "
+                       << "events, fall back to host-side layer profile only. "
+                       << "create_success=" << create_success
+                       << ", anchor_ret=" << anchor_ret
+                       << ", stream=" << static_cast<void*>(compute_stream);
+        }
+      }
+#endif
+    }
+
     for (size_t i = 0; i < layers_.size(); i++) {
       aclrtEvent* event = nullptr;
       std::atomic<bool>* event_flag = nullptr;
@@ -231,6 +372,9 @@ class LlmModelImplBase : public torch::nn::Module {
         event_flag = input_params.layer_synchronizer->get_event_flag(i);
       }
       if (!input_params.synchronize_layer(i)) {
+#if defined(USE_NPU)
+        cleanup_chunk_events();
+#endif
         return ModelOutput();
       }
 
@@ -238,10 +382,43 @@ class LlmModelImplBase : public torch::nn::Module {
 
       if (layer_forward_interrupted_) {
         LOG(INFO) << "Forward interrupted at layer: " << i;
+#if defined(USE_NPU)
+        cleanup_chunk_events();
+#endif
         return ModelOutput();
       }
       const int32_t layer_index = i;
       rolling_guard.before_layer(layer_index);
+
+#if defined(USE_NPU)
+      if (enable_compute_chunk_profile && chunk_layers > 0 &&
+          i % chunk_layers == 0) {
+        const size_t chunk_idx = i / chunk_layers;
+        const auto ret =
+            aclrtRecordEvent(chunk_start_events[chunk_idx], compute_stream);
+        if (ret != ACL_SUCCESS && !chunk_profile_record_error_logged) {
+          chunk_profile_record_error_logged = true;
+          LOG(WARNING)
+              << "[chunk_profile_debug] record chunk start event failed: "
+              << "ret=" << ret << ", chunk_idx=" << chunk_idx
+              << ", stream=" << static_cast<void*>(compute_stream);
+        }
+      }
+#endif
+
+      const auto layer_start = std::chrono::steady_clock::now();
+      if (enable_layer_exec_profile) {
+        const int64_t interval_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                layer_start - prev_layer_end)
+                .count();
+        batch_interval_us += interval_us;
+        layer_interval_us_list[i] = interval_us;
+        if (interval_us > max_layer_interval_us) {
+          max_layer_interval_us = interval_us;
+          max_layer_interval_idx = static_cast<int64_t>(i);
+        }
+      }
 
       layer(h,
             cos_pos,
@@ -252,7 +429,453 @@ class LlmModelImplBase : public torch::nn::Module {
             event,
             event_flag);
 
+      if (enable_layer_exec_profile) {
+        const auto layer_end = std::chrono::steady_clock::now();
+        const int64_t exec_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(layer_end -
+                                                                  layer_start)
+                .count();
+        batch_exec_us += exec_us;
+        layer_exec_us_list[i] = exec_us;
+        if (exec_us > max_layer_exec_us) {
+          max_layer_exec_us = exec_us;
+          max_layer_exec_idx = static_cast<int64_t>(i);
+        }
+        prev_layer_end = layer_end;
+      }
+
+#if defined(USE_NPU)
+      if (enable_compute_chunk_profile && chunk_layers > 0) {
+        const size_t chunk_idx = i / chunk_layers;
+        const size_t chunk_end_layer =
+            std::min(layers_.size(),
+                     static_cast<size_t>((chunk_idx + 1) * chunk_layers));
+        if (i + 1 == chunk_end_layer) {
+          const auto ret =
+              aclrtRecordEvent(chunk_end_events[chunk_idx], compute_stream);
+          if (ret != ACL_SUCCESS && !chunk_profile_record_error_logged) {
+            chunk_profile_record_error_logged = true;
+            LOG(WARNING)
+                << "[chunk_profile_debug] record chunk end event failed: "
+                << "ret=" << ret << ", chunk_idx=" << chunk_idx
+                << ", stream=" << static_cast<void*>(compute_stream);
+          }
+        }
+      }
+#endif
+
       rolling_guard.after_layer(layer_index);
+    }
+
+    if (enable_layer_exec_profile) {
+#if defined(USE_NPU)
+      if (enable_compute_chunk_profile && !chunk_end_events.empty()) {
+        const auto ret =
+            aclrtSynchronizeEventWithTimeout(chunk_end_events.back(), -1);
+        if (ret != ACL_SUCCESS) {
+          LOG(WARNING) << "Synchronize chunk end event failed: " << ret;
+        } else {
+          for (size_t chunk_idx = 0; chunk_idx < chunk_end_events.size();
+               ++chunk_idx) {
+            float exec_ms = 0.0f;
+            const auto exec_elapsed_ret =
+                aclrtEventElapsedTime(&exec_ms,
+                                      chunk_start_events[chunk_idx],
+                                      chunk_end_events[chunk_idx]);
+            if (exec_elapsed_ret == ACL_SUCCESS) {
+              const int64_t exec_us = static_cast<int64_t>(exec_ms * 1000.0f);
+              chunk_exec_us_list[chunk_idx] = exec_us;
+              batch_chunk_exec_us += exec_us;
+              if (exec_us > max_chunk_exec_us) {
+                max_chunk_exec_us = exec_us;
+                max_chunk_exec_idx = static_cast<int64_t>(chunk_idx);
+              }
+            } else if (!chunk_profile_elapsed_error_logged) {
+              chunk_profile_elapsed_error_logged = true;
+              LOG(WARNING)
+                  << "[chunk_profile_debug] elapsed chunk exec failed: "
+                  << "ret=" << exec_elapsed_ret << ", chunk_idx=" << chunk_idx
+                  << ", event_stream=" << static_cast<void*>(compute_stream);
+            }
+            if (chunk_idx > 0) {
+              float idle_ms = 0.0f;
+              const auto idle_elapsed_ret =
+                  aclrtEventElapsedTime(&idle_ms,
+                                        chunk_end_events[chunk_idx - 1],
+                                        chunk_start_events[chunk_idx]);
+              if (idle_elapsed_ret == ACL_SUCCESS) {
+                const int64_t idle_us = static_cast<int64_t>(idle_ms * 1000.0f);
+                chunk_idle_us_list[chunk_idx] = idle_us;
+                batch_chunk_idle_us += idle_us;
+                if (idle_us > max_chunk_idle_us) {
+                  max_chunk_idle_us = idle_us;
+                  max_chunk_idle_idx = static_cast<int64_t>(chunk_idx);
+                }
+              } else if (!chunk_profile_elapsed_error_logged) {
+                chunk_profile_elapsed_error_logged = true;
+                LOG(WARNING)
+                    << "[chunk_profile_debug] elapsed chunk idle failed: "
+                    << "ret=" << idle_elapsed_ret << ", chunk_idx=" << chunk_idx
+                    << ", event_stream=" << static_cast<void*>(compute_stream);
+              }
+            }
+          }
+        }
+      }
+      cleanup_chunk_events();
+#endif
+
+      batch_chunk_count = static_cast<int64_t>(chunk_idle_us_list.size());
+      for (const auto idle_us : chunk_idle_us_list) {
+        if (idle_us != 0) {
+          batch_chunk_nonzero_count += 1;
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lock(
+            g_layer_exec_profiled_chunk_totals_mutex);
+        if (g_layer_exec_profiled_chunk_idle_us_sum_list.size() <
+            chunk_idle_us_list.size()) {
+          g_layer_exec_profiled_chunk_idle_us_sum_list.resize(
+              chunk_idle_us_list.size(), 0);
+          g_layer_exec_profiled_chunk_sample_count_list.resize(
+              chunk_idle_us_list.size(), 0);
+          g_layer_exec_profiled_chunk_idle_us_max_list.resize(
+              chunk_idle_us_list.size(), 0);
+          g_layer_exec_profiled_chunk_idle_lower_heaps.resize(
+              chunk_idle_us_list.size());
+          g_layer_exec_profiled_chunk_idle_upper_heaps.resize(
+              chunk_idle_us_list.size());
+        }
+        for (size_t chunk_idx = 0; chunk_idx < chunk_idle_us_list.size();
+             ++chunk_idx) {
+          const int64_t idle_us = chunk_idle_us_list[chunk_idx];
+          g_layer_exec_profiled_chunk_idle_us_sum_list[chunk_idx] += idle_us;
+          g_layer_exec_profiled_chunk_sample_count_list[chunk_idx] += 1;
+          if (idle_us >
+              g_layer_exec_profiled_chunk_idle_us_max_list[chunk_idx]) {
+            g_layer_exec_profiled_chunk_idle_us_max_list[chunk_idx] = idle_us;
+          }
+          auto& lower_heap =
+              g_layer_exec_profiled_chunk_idle_lower_heaps[chunk_idx];
+          auto& upper_heap =
+              g_layer_exec_profiled_chunk_idle_upper_heaps[chunk_idx];
+          if (lower_heap.empty() || idle_us <= lower_heap.top()) {
+            lower_heap.push(idle_us);
+          } else {
+            upper_heap.push(idle_us);
+          }
+          if (lower_heap.size() > upper_heap.size() + 1) {
+            upper_heap.push(lower_heap.top());
+            lower_heap.pop();
+          } else if (upper_heap.size() > lower_heap.size()) {
+            lower_heap.push(upper_heap.top());
+            upper_heap.pop();
+          }
+        }
+      }
+      int64_t prev_max_all_chunk_idle_us =
+          g_layer_exec_profiled_all_chunk_idle_us_max.load(
+              std::memory_order_relaxed);
+      while (prev_max_all_chunk_idle_us < max_chunk_idle_us &&
+             !g_layer_exec_profiled_all_chunk_idle_us_max.compare_exchange_weak(
+                 prev_max_all_chunk_idle_us,
+                 max_chunk_idle_us,
+                 std::memory_order_relaxed,
+                 std::memory_order_relaxed)) {
+      }
+
+      const int64_t total_exec_us =
+          g_layer_exec_profiled_exec_us.fetch_add(batch_exec_us,
+                                                  std::memory_order_relaxed) +
+          batch_exec_us;
+      const int64_t total_interval_us =
+          g_layer_exec_profiled_interval_us.fetch_add(
+              batch_interval_us, std::memory_order_relaxed) +
+          batch_interval_us;
+      const int64_t total_chunk_exec_us =
+          g_layer_exec_profiled_chunk_exec_us.fetch_add(
+              batch_chunk_exec_us, std::memory_order_relaxed) +
+          batch_chunk_exec_us;
+      const int64_t total_chunk_idle_us =
+          g_layer_exec_profiled_chunk_idle_us.fetch_add(
+              batch_chunk_idle_us, std::memory_order_relaxed) +
+          batch_chunk_idle_us;
+      const int64_t total_chunk_count =
+          g_layer_exec_profiled_chunk_count.fetch_add(
+              batch_chunk_count, std::memory_order_relaxed) +
+          batch_chunk_count;
+      const int64_t total_chunk_nonzero_count =
+          g_layer_exec_profiled_chunk_nonzero_count.fetch_add(
+              batch_chunk_nonzero_count, std::memory_order_relaxed) +
+          batch_chunk_nonzero_count;
+      int64_t prev_max_chunk_idle_us =
+          g_layer_exec_profiled_chunk_idle_us_max.load(
+              std::memory_order_relaxed);
+      while (prev_max_chunk_idle_us < batch_chunk_idle_us &&
+             !g_layer_exec_profiled_chunk_idle_us_max.compare_exchange_weak(
+                 prev_max_chunk_idle_us,
+                 batch_chunk_idle_us,
+                 std::memory_order_relaxed,
+                 std::memory_order_relaxed)) {
+      }
+      // Track exact running median (p50) of batch_chunk_idle_us across all
+      // profiled steps.
+      {
+        std::lock_guard<std::mutex> lock(
+            g_layer_exec_profiled_batch_idle_median_mutex);
+        if (g_layer_exec_profiled_batch_idle_lower.empty() ||
+            batch_chunk_idle_us <=
+                g_layer_exec_profiled_batch_idle_lower.top()) {
+          g_layer_exec_profiled_batch_idle_lower.push(batch_chunk_idle_us);
+        } else {
+          g_layer_exec_profiled_batch_idle_upper.push(batch_chunk_idle_us);
+        }
+        if (g_layer_exec_profiled_batch_idle_lower.size() >
+            g_layer_exec_profiled_batch_idle_upper.size() + 1) {
+          g_layer_exec_profiled_batch_idle_upper.push(
+              g_layer_exec_profiled_batch_idle_lower.top());
+          g_layer_exec_profiled_batch_idle_lower.pop();
+        } else if (g_layer_exec_profiled_batch_idle_upper.size() >
+                   g_layer_exec_profiled_batch_idle_lower.size()) {
+          g_layer_exec_profiled_batch_idle_lower.push(
+              g_layer_exec_profiled_batch_idle_upper.top());
+          g_layer_exec_profiled_batch_idle_upper.pop();
+        }
+      }
+      // Track exact running median (p50) of all chunk idle values across all
+      // profiled steps.
+      {
+        std::lock_guard<std::mutex> lock(
+            g_layer_exec_profiled_all_chunk_idle_median_mutex);
+        for (const auto idle_us : chunk_idle_us_list) {
+          if (g_layer_exec_profiled_all_chunk_idle_lower.empty() ||
+              idle_us <= g_layer_exec_profiled_all_chunk_idle_lower.top()) {
+            g_layer_exec_profiled_all_chunk_idle_lower.push(idle_us);
+          } else {
+            g_layer_exec_profiled_all_chunk_idle_upper.push(idle_us);
+          }
+          if (g_layer_exec_profiled_all_chunk_idle_lower.size() >
+              g_layer_exec_profiled_all_chunk_idle_upper.size() + 1) {
+            g_layer_exec_profiled_all_chunk_idle_upper.push(
+                g_layer_exec_profiled_all_chunk_idle_lower.top());
+            g_layer_exec_profiled_all_chunk_idle_lower.pop();
+          } else if (g_layer_exec_profiled_all_chunk_idle_upper.size() >
+                     g_layer_exec_profiled_all_chunk_idle_lower.size()) {
+            g_layer_exec_profiled_all_chunk_idle_lower.push(
+                g_layer_exec_profiled_all_chunk_idle_upper.top());
+            g_layer_exec_profiled_all_chunk_idle_upper.pop();
+          }
+        }
+      }
+      const int64_t profiled_batches = g_layer_exec_profiled_batches.fetch_add(
+                                           1, std::memory_order_relaxed) +
+                                       1;
+      const int64_t log_interval =
+          std::max<int64_t>(1, FLAGS_layer_exec_profile_log_interval);
+      if (profiled_batches % log_interval == 0) {
+        const int64_t avg_exec_us = total_exec_us / profiled_batches;
+        const int64_t avg_interval_us = total_interval_us / profiled_batches;
+        const int64_t avg_chunk_exec_us =
+            total_chunk_exec_us / profiled_batches;
+        const int64_t avg_chunk_idle_us =
+            total_chunk_idle_us / profiled_batches;
+        const double chunk_idle_nonzero_ratio_total =
+            total_chunk_count > 0
+                ? 100.0 * static_cast<double>(total_chunk_nonzero_count) /
+                      static_cast<double>(total_chunk_count)
+                : 0.0;
+        const double avg_chunk_idle_nonzero_us_total =
+            total_chunk_nonzero_count > 0
+                ? static_cast<double>(total_chunk_idle_us) /
+                      static_cast<double>(total_chunk_nonzero_count)
+                : 0.0;
+        const int64_t max_batch_chunk_idle_us_total =
+            g_layer_exec_profiled_chunk_idle_us_max.load(
+                std::memory_order_relaxed);
+        const int64_t max_all_chunk_idle_us_total =
+            g_layer_exec_profiled_all_chunk_idle_us_max.load(
+                std::memory_order_relaxed);
+        double p50_batch_idle_us_total = 0.0;
+        bool has_p50_batch_idle_us_total = false;
+        {
+          std::lock_guard<std::mutex> lock(
+              g_layer_exec_profiled_batch_idle_median_mutex);
+          if (!g_layer_exec_profiled_batch_idle_lower.empty()) {
+            has_p50_batch_idle_us_total = true;
+            if (g_layer_exec_profiled_batch_idle_lower.size() ==
+                g_layer_exec_profiled_batch_idle_upper.size()) {
+              p50_batch_idle_us_total =
+                  (static_cast<double>(
+                       g_layer_exec_profiled_batch_idle_lower.top()) +
+                   static_cast<double>(
+                       g_layer_exec_profiled_batch_idle_upper.top())) /
+                  2.0;
+            } else {
+              p50_batch_idle_us_total = static_cast<double>(
+                  g_layer_exec_profiled_batch_idle_lower.top());
+            }
+          }
+        }
+        double p50_all_chunk_idle_us_total = 0.0;
+        bool has_p50_all_chunk_idle_us_total = false;
+        {
+          std::lock_guard<std::mutex> lock(
+              g_layer_exec_profiled_all_chunk_idle_median_mutex);
+          if (!g_layer_exec_profiled_all_chunk_idle_lower.empty()) {
+            has_p50_all_chunk_idle_us_total = true;
+            if (g_layer_exec_profiled_all_chunk_idle_lower.size() ==
+                g_layer_exec_profiled_all_chunk_idle_upper.size()) {
+              p50_all_chunk_idle_us_total =
+                  (static_cast<double>(
+                       g_layer_exec_profiled_all_chunk_idle_lower.top()) +
+                   static_cast<double>(
+                       g_layer_exec_profiled_all_chunk_idle_upper.top())) /
+                  2.0;
+            } else {
+              p50_all_chunk_idle_us_total = static_cast<double>(
+                  g_layer_exec_profiled_all_chunk_idle_lower.top());
+            }
+          }
+        }
+        std::vector<int64_t> chunk_idle_us_sum_total_list;
+        std::vector<int64_t> chunk_sample_count_total_list;
+        std::vector<int64_t> chunk_idle_us_max_total_list;
+        std::vector<double> chunk_idle_us_p50_total_list;
+        {
+          std::lock_guard<std::mutex> lock(
+              g_layer_exec_profiled_chunk_totals_mutex);
+          chunk_idle_us_sum_total_list =
+              g_layer_exec_profiled_chunk_idle_us_sum_list;
+          chunk_sample_count_total_list =
+              g_layer_exec_profiled_chunk_sample_count_list;
+          chunk_idle_us_max_total_list =
+              g_layer_exec_profiled_chunk_idle_us_max_list;
+          chunk_idle_us_p50_total_list.resize(
+              g_layer_exec_profiled_chunk_idle_lower_heaps.size(), 0.0);
+          for (size_t chunk_idx = 0;
+               chunk_idx < g_layer_exec_profiled_chunk_idle_lower_heaps.size();
+               ++chunk_idx) {
+            const auto& lower_heap =
+                g_layer_exec_profiled_chunk_idle_lower_heaps[chunk_idx];
+            const auto& upper_heap =
+                g_layer_exec_profiled_chunk_idle_upper_heaps[chunk_idx];
+            if (lower_heap.empty()) {
+              chunk_idle_us_p50_total_list[chunk_idx] = 0.0;
+            } else if (lower_heap.size() == upper_heap.size()) {
+              chunk_idle_us_p50_total_list[chunk_idx] =
+                  (static_cast<double>(lower_heap.top()) +
+                   static_cast<double>(upper_heap.top())) /
+                  2.0;
+            } else {
+              chunk_idle_us_p50_total_list[chunk_idx] =
+                  static_cast<double>(lower_heap.top());
+            }
+          }
+        }
+        auto format_us_list_ms = [](const std::vector<int64_t>& values) {
+          std::ostringstream oss;
+          oss << "[";
+          for (size_t idx = 0; idx < values.size(); ++idx) {
+            if (idx > 0) {
+              oss << "|";
+            }
+            oss << std::fixed << std::setprecision(3)
+                << static_cast<double>(values[idx]) / 1000.0;
+          }
+          oss << "]";
+          return oss.str();
+        };
+        auto format_int_list = [](const std::vector<int64_t>& values) {
+          std::ostringstream oss;
+          oss << "[";
+          for (size_t idx = 0; idx < values.size(); ++idx) {
+            if (idx > 0) {
+              oss << "|";
+            }
+            oss << values[idx];
+          }
+          oss << "]";
+          return oss.str();
+        };
+        auto format_double_us_list_ms = [](const std::vector<double>& values) {
+          std::ostringstream oss;
+          oss << "[";
+          for (size_t idx = 0; idx < values.size(); ++idx) {
+            if (idx > 0) {
+              oss << "|";
+            }
+            oss << std::fixed << std::setprecision(3) << values[idx] / 1000.0;
+          }
+          oss << "]";
+          return oss.str();
+        };
+        LOG(INFO)
+            << "[layer_exec_profile] batches=" << profiled_batches
+            << ", batch_id=" << input_params.batch_id << ", mode="
+            << (input_params.batch_forward_type.is_decode() ? "decode"
+                                                            : "prefill")
+            << ", layers=" << layers_.size()
+            << ", batch_exec_ms=" << static_cast<double>(batch_exec_us) / 1000.0
+            << ", batch_interval_ms="
+            << static_cast<double>(batch_interval_us) / 1000.0
+            << ", avg_exec_ms=" << static_cast<double>(avg_exec_us) / 1000.0
+            << ", avg_interval_ms="
+            << static_cast<double>(avg_interval_us) / 1000.0
+            << ", max_layer_exec_ms(layer=" << max_layer_exec_idx
+            << ")=" << static_cast<double>(max_layer_exec_us) / 1000.0
+            << ", max_layer_interval_ms(before_layer=" << max_layer_interval_idx
+            << ")=" << static_cast<double>(max_layer_interval_us) / 1000.0
+            << ", chunk_size=" << chunk_layers
+            << ", chunks=" << chunk_exec_us_list.size()
+            << ", batch_chunk_exec_ms="
+            << static_cast<double>(batch_chunk_exec_us) / 1000.0
+            << ", batch_chunk_idle_ms="
+            << static_cast<double>(batch_chunk_idle_us) / 1000.0
+            << ", avg_chunk_exec_ms="
+            << static_cast<double>(avg_chunk_exec_us) / 1000.0
+            << ", avg_chunk_idle_ms="
+            << static_cast<double>(avg_chunk_idle_us) / 1000.0
+            << ", sum_chunk_idle_ms_total="
+            << static_cast<double>(total_chunk_idle_us) / 1000.0
+            << ", total_chunk_count=" << total_chunk_count
+            << ", total_chunk_nonzero_count=" << total_chunk_nonzero_count
+            << ", chunk_idle_nonzero_ratio_total(%)="
+            << chunk_idle_nonzero_ratio_total
+            << ", avg_chunk_idle_ms_when_nonzero_total="
+            << avg_chunk_idle_nonzero_us_total / 1000.0
+            // Historical name was max_chunk_idle_ms_total; this is
+            // actually max of batch_chunk_idle_ms (sum of chunk idles).
+            << ", max_batch_idle_ms_sum_chunks_total="
+            << static_cast<double>(max_batch_chunk_idle_us_total) / 1000.0
+            << ", p50_batch_idle_ms_sum_chunks_total="
+            << (has_p50_batch_idle_us_total ? p50_batch_idle_us_total / 1000.0
+                                            : 0.0)
+            << ", p50_all_chunks_idle_ms_total="
+            << (has_p50_all_chunk_idle_us_total
+                    ? p50_all_chunk_idle_us_total / 1000.0
+                    : 0.0)
+            << ", max_all_chunks_idle_ms_total="
+            << static_cast<double>(max_all_chunk_idle_us_total) / 1000.0
+            << ", max_chunk_exec_ms(chunk=" << max_chunk_exec_idx
+            << ")=" << static_cast<double>(max_chunk_exec_us) / 1000.0
+            << ", max_chunk_idle_ms(before_chunk=" << max_chunk_idle_idx
+            << ")=" << static_cast<double>(max_chunk_idle_us) / 1000.0
+            << ", chunk_idle_ms_sum_total_list="
+            << format_us_list_ms(chunk_idle_us_sum_total_list)
+            << ", chunk_sample_count_total_list="
+            << format_int_list(chunk_sample_count_total_list)
+            << ", chunk_idle_ms_max_total_list="
+            << format_us_list_ms(chunk_idle_us_max_total_list)
+            << ", chunk_idle_ms_p50_total_list="
+            << format_double_us_list_ms(chunk_idle_us_p50_total_list)
+            << ", layer_exec_ms_list=" << format_us_list_ms(layer_exec_us_list)
+            << ", layer_interval_ms_before_layer_list="
+            << format_us_list_ms(layer_interval_us_list)
+            << ", chunk_exec_ms_list=" << format_us_list_ms(chunk_exec_us_list)
+            << ", chunk_idle_ms_before_chunk_list="
+            << format_us_list_ms(chunk_idle_us_list);
+      }
     }
 
     auto hidden_states = norm_(h, 0);

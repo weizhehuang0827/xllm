@@ -184,6 +184,14 @@ DECLARE_uint32(prefetch_bacth_size);
 
 DECLARE_uint32(layers_wise_copy_batchs);
 
+DECLARE_bool(enable_h2d_overlap_profile);
+
+DECLARE_int32(h2d_overlap_profile_log_interval);
+
+DECLARE_bool(enable_layer_exec_profile);
+
+DECLARE_int32(layer_exec_profile_log_interval);
+
 DECLARE_string(priority_strategy);
 
 DECLARE_bool(use_mix_scheduler);

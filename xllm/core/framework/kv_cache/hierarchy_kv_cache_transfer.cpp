@@ -19,6 +19,7 @@ limitations under the License.
 #include <sys/mman.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <memory>
 
@@ -301,6 +302,7 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
   uint32_t copy_cnt =
       (num_layers + layers_per_bacth_copy - 1) / layers_per_bacth_copy;
   auto synchronizer = std::make_shared<NPULayerSynchronizerImpl>(copy_cnt);
+
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (layer_wise_load_synchronizer_.count(batch_id) != 0) {
@@ -313,7 +315,9 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
   size_t attrs_indexes[1] = {0};
 
   std::unique_ptr<Stream> stream;
+
   copy_stream_.wait_dequeue(stream);
+
   c10::StreamGuard streamGuard = stream->set_stream_guard();
   aclError ret = 0;
 
@@ -322,7 +326,10 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
   size_t* copy_size = new size_t[num_batches * layers_per_bacth_copy];
 
   for (int index = 0; index < copy_cnt; index++) {
+    const auto layer_copy_begin = std::chrono::steady_clock::now();
+
     int layer_id = index * layers_per_bacth_copy;
+    const int64_t start_layer_id = layer_id;
     size_t fail_index = 0;
     uint32_t curr_index = 0;
     uint32_t layer_cnt = 0;
@@ -382,6 +389,15 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
         LOG(ERROR) << "aclrtRecordEvent error: " << ret;
       }
     }
+
+    const auto layer_copy_end = std::chrono::steady_clock::now();
+    const int64_t layer_copy_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(layer_copy_end -
+                                                              layer_copy_begin)
+            .count();
+    synchronizer->add_h2d_copy_time_us(index, layer_copy_elapsed_us);
+    synchronizer->set_layer_range(index, start_layer_id, layer_id);
+
     auto* event_flag = synchronizer->get_event_flag(index);
     event_flag->store(true, std::memory_order_release);
     if (ret != 0) break;

@@ -84,6 +84,9 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
 
  private:
   void allocate_host_shared(Sequence* sequence);
+  size_t transfer_offload_blocks();
+  void maybe_log_transfer_profile(size_t step_h2d_blocks,
+                                  size_t step_d2h_blocks);
 
  private:
   Engine* engine_;
@@ -92,6 +95,18 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   // BlockTransferInfo per step
   std::vector<std::vector<BlockTransferInfo>> load_block_transfer_infos_;
   std::vector<OffloadBlockPairQueue> offload_block_pair_queues_;
+
+  // Step-level transfer profile (windowed log).
+  size_t transfer_profiled_steps_ = 0;
+  size_t transfer_profile_h2d_blocks_total_ = 0;
+  size_t transfer_profile_d2h_blocks_total_ = 0;
+  size_t transfer_profile_h2d_blocks_window_ = 0;
+  size_t transfer_profile_d2h_blocks_window_ = 0;
+  size_t transfer_profile_h2d_blocks_window_max_ = 0;
+  size_t transfer_profile_d2h_blocks_window_max_ = 0;
+  size_t transfer_profile_h2d_blocks_total_max_ = 0;
+  size_t transfer_profile_d2h_blocks_total_max_ = 0;
+  size_t transfer_profile_window_steps_ = 0;
 };
 
 }  // namespace xllm

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "hierarchy_block_manager_pool.h"
 
+#include <algorithm>
+
 #include "block_manager_impl.h"
 #include "common/global_flags.h"
 #include "concurrent_block_manager_impl.h"
@@ -361,8 +363,11 @@ bool HierarchyBlockManagerPool::update_prefetch_result(
 
 void HierarchyBlockManagerPool::transfer_blocks(std::vector<Batch>& batches) {
   // load blocks from host to device
+  size_t step_h2d_blocks = 0;
   for (size_t i = 0; i < batches.size(); i++) {
-    if (!load_block_transfer_infos_[i].empty()) {
+    const size_t batch_h2d_blocks = load_block_transfer_infos_[i].size();
+    if (batch_h2d_blocks > 0) {
+      step_h2d_blocks += batch_h2d_blocks;
       batches[i].set_batch_id();
       engine_->transfer_kv_blocks(
           i, batches[i].batch_id(), std::move(load_block_transfer_infos_[i]));
@@ -372,10 +377,18 @@ void HierarchyBlockManagerPool::transfer_blocks(std::vector<Batch>& batches) {
   load_block_transfer_infos_.clear();
   load_block_transfer_infos_.resize(host_block_managers_.size());
 
-  transfer_blocks();
+  const size_t step_d2h_blocks = transfer_offload_blocks();
+  maybe_log_transfer_profile(step_h2d_blocks, step_d2h_blocks);
 }
 
 void HierarchyBlockManagerPool::transfer_blocks() {
+  const size_t step_h2d_blocks = 0;
+  const size_t step_d2h_blocks = transfer_offload_blocks();
+  maybe_log_transfer_profile(step_h2d_blocks, step_d2h_blocks);
+}
+
+size_t HierarchyBlockManagerPool::transfer_offload_blocks() {
+  size_t step_d2h_blocks = 0;
   // offload blocks from device to host and kvcache store
   for (int i = 0; i < offload_block_pair_queues_.size(); i++) {
     std::vector<BlockTransferInfo> release_transfer_infos;
@@ -406,6 +419,9 @@ void HierarchyBlockManagerPool::transfer_blocks() {
       }
       block_pair.reset();
     }
+
+    step_d2h_blocks += release_transfer_infos.size();
+    step_d2h_blocks += keep_transfer_infos.size();
 
     if (!release_transfer_infos.empty()) {
       folly::collectAll(std::move(engine_->transfer_kv_blocks(
@@ -456,6 +472,70 @@ void HierarchyBlockManagerPool::transfer_blocks() {
           });
     }
   }
+  return step_d2h_blocks;
+}
+
+void HierarchyBlockManagerPool::maybe_log_transfer_profile(
+    size_t step_h2d_blocks,
+    size_t step_d2h_blocks) {
+  transfer_profiled_steps_ += 1;
+  transfer_profile_window_steps_ += 1;
+  transfer_profile_h2d_blocks_total_ += step_h2d_blocks;
+  transfer_profile_d2h_blocks_total_ += step_d2h_blocks;
+  transfer_profile_h2d_blocks_window_ += step_h2d_blocks;
+  transfer_profile_d2h_blocks_window_ += step_d2h_blocks;
+  transfer_profile_h2d_blocks_window_max_ =
+      std::max(transfer_profile_h2d_blocks_window_max_, step_h2d_blocks);
+  transfer_profile_d2h_blocks_window_max_ =
+      std::max(transfer_profile_d2h_blocks_window_max_, step_d2h_blocks);
+  transfer_profile_h2d_blocks_total_max_ =
+      std::max(transfer_profile_h2d_blocks_total_max_, step_h2d_blocks);
+  transfer_profile_d2h_blocks_total_max_ =
+      std::max(transfer_profile_d2h_blocks_total_max_, step_d2h_blocks);
+
+  // Keep cadence aligned with layer exec profile logging to limit log volume.
+  const size_t log_interval = std::max<size_t>(
+      1, static_cast<size_t>(FLAGS_layer_exec_profile_log_interval));
+  if (transfer_profile_window_steps_ % log_interval != 0) {
+    return;
+  }
+
+  const double avg_h2d_blocks_window =
+      static_cast<double>(transfer_profile_h2d_blocks_window_) /
+      transfer_profile_window_steps_;
+  const double avg_d2h_blocks_window =
+      static_cast<double>(transfer_profile_d2h_blocks_window_) /
+      transfer_profile_window_steps_;
+  const double avg_h2d_blocks_total =
+      static_cast<double>(transfer_profile_h2d_blocks_total_) /
+      transfer_profiled_steps_;
+  const double avg_d2h_blocks_total =
+      static_cast<double>(transfer_profile_d2h_blocks_total_) /
+      transfer_profiled_steps_;
+
+  LOG(INFO)
+      << "[transfer_block_profile] steps=" << transfer_profiled_steps_
+      << ", window_steps=" << transfer_profile_window_steps_
+      << ", step_h2d_blocks=" << step_h2d_blocks
+      << ", step_d2h_blocks=" << step_d2h_blocks
+      << ", sum_h2d_blocks_window=" << transfer_profile_h2d_blocks_window_
+      << ", sum_d2h_blocks_window=" << transfer_profile_d2h_blocks_window_
+      << ", avg_h2d_blocks_window=" << avg_h2d_blocks_window
+      << ", avg_d2h_blocks_window=" << avg_d2h_blocks_window
+      << ", max_h2d_blocks_window=" << transfer_profile_h2d_blocks_window_max_
+      << ", max_d2h_blocks_window=" << transfer_profile_d2h_blocks_window_max_
+      << ", sum_h2d_blocks_total=" << transfer_profile_h2d_blocks_total_
+      << ", sum_d2h_blocks_total=" << transfer_profile_d2h_blocks_total_
+      << ", avg_h2d_blocks_total=" << avg_h2d_blocks_total
+      << ", avg_d2h_blocks_total=" << avg_d2h_blocks_total
+      << ", max_h2d_blocks_total=" << transfer_profile_h2d_blocks_total_max_
+      << ", max_d2h_blocks_total=" << transfer_profile_d2h_blocks_total_max_;
+
+  transfer_profile_h2d_blocks_window_ = 0;
+  transfer_profile_d2h_blocks_window_ = 0;
+  transfer_profile_h2d_blocks_window_max_ = 0;
+  transfer_profile_d2h_blocks_window_max_ = 0;
+  transfer_profile_window_steps_ = 0;
 }
 
 void HierarchyBlockManagerPool::get_merged_kvcache_event(

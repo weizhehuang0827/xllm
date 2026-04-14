@@ -107,6 +107,10 @@ const OptionCategory kOtherOptions = {
      "num_response_handling_threads",
      "prefill_scheduling_memory_usage_threshold",
      "n_off",
+     "enable_h2d_overlap_profile",
+     "h2d_overlap_profile_log_interval",
+     "enable_layer_exec_profile",
+     "layer_exec_profile_log_interval",
      "use_contiguous_input_buffer",
      "use_audio_in_video"}};
 

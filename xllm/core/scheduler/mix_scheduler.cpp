@@ -614,8 +614,18 @@ std::vector<Batch> MixScheduler::prepare_batch() {
   GAUGE_SET(num_running_requests, running_requests_.size());
   GAUGE_SET(num_preempted_requests, num_preempted_requests);
   if (num_preempted_requests > 0) {
-    LOG(INFO) << "Number of preempted requests in this round: "
-              << num_preempted_requests;
+    const size_t non_empty_batches = std::count_if(
+        batches.begin(), batches.end(), [](const Batch& one_batch) {
+          return !one_batch.empty();
+        });
+    LOG(INFO) << "[preempt_round] preempted=" << num_preempted_requests
+              << ", scheduled_requests=" << running_requests_.size()
+              << ", scheduled_sequences=" << running_sequences_.size()
+              << ", queue_remaining=" << running_queue_.size()
+              << ", non_empty_batches=" << non_empty_batches
+              << ", batches_empty=" << is_batches_empty
+              << ", budget_exhausted=" << budget_exhausted
+              << ", blocks_exhausted=" << blocks_exhausted;
   }
 
   GAUGE_SET(num_running_sequences, running_sequences_.size());
