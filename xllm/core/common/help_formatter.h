@@ -108,6 +108,8 @@ const OptionCategory kOtherOptions = {
      "prefill_scheduling_memory_usage_threshold",
      "profile_h2d_time",
      "profile_h2d_time_with_d2h",
+     "profile_d2h_time",
+     "profile_fixed_d2h_blocks",
      "use_contiguous_input_buffer",
      "use_audio_in_video"}};
 

@@ -105,6 +105,10 @@ class ContinuousScheduler : public Scheduler {
 
     PROPERTY(bool, profile_h2d_time_with_d2h) = false;
 
+    PROPERTY(bool, profile_d2h_time) = false;
+
+    PROPERTY(int32_t, profile_fixed_d2h_blocks) = -1;
+
     PROPERTY(bool, enable_latency_aware_schedule) = false;
     // the max prompt length for profile
     PROPERTY(int32_t, profile_max_prompt_length) = 2048;

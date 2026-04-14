@@ -323,6 +323,8 @@ int run() {
       .enable_profile_token_budget(FLAGS_enable_profile_token_budget)
       .profile_h2d_time(FLAGS_profile_h2d_time)
       .profile_h2d_time_with_d2h(FLAGS_profile_h2d_time_with_d2h)
+      .profile_d2h_time(FLAGS_profile_d2h_time)
+      .profile_fixed_d2h_blocks(FLAGS_profile_fixed_d2h_blocks)
       .enable_latency_aware_schedule(FLAGS_enable_latency_aware_schedule)
       .profile_max_prompt_length(FLAGS_profile_max_prompt_length)
       .enable_profile_kv_blocks(FLAGS_enable_profile_kv_blocks)

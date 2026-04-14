@@ -364,50 +364,68 @@ void HierarchyBlockManagerPool::get_merged_kvcache_event(
 }
 
 // for profile swap time only
-void HierarchyBlockManagerPool::transfer_host_block_only(bool profile_with_d2h) {
-  
-  // load_block_transfer_infos_[dp_rank].emplace_back(
-  //         BlockTransferInfo(host_blocks[i].id(),
-  //                           hbm_blocks[i].id(),
-  //                           host_blocks[i].get_immutable_hash_value(),
-  //                           TransferType::H2D));
+void HierarchyBlockManagerPool::transfer_host_block_only(
+    bool profile_with_h2d,
+    bool profile_with_d2h,
+    int32_t fixed_d2h_blocks) {
+  if (!profile_with_h2d && !profile_with_d2h) {
+    LOG(WARNING) << "Skip profiling because both H2D and D2H are disabled.";
+    return;
+  }
 
-  
+  LOG(INFO) << "Start host-device transfer profiling. profile_with_h2d="
+            << profile_with_h2d
+            << ", profile_with_d2h=" << profile_with_d2h
+            << ", fixed_d2h_blocks=" << fixed_d2h_blocks;
+
+  if (fixed_d2h_blocks == 0 || fixed_d2h_blocks < -1) {
+    LOG(WARNING) << "Invalid fixed_d2h_blocks=" << fixed_d2h_blocks
+                 << ", fallback to -1 (follow H2D batch size).";
+    fixed_d2h_blocks = -1;
+  }
+
   uint8_t buffer[XXH3_128BITS_HASH_VALUE_LEN] = {0};
-  for  (int i = 4; i <= 400; i = i + 4){
-  // for  (int i = 2; i <= 40; i = i + 2){
+  for (int i = 4; i <= 200; i += 4) {
     std::vector<BlockTransferInfo> h2d_transfer_infos;
     std::vector<BlockTransferInfo> d2h_transfer_infos;
-    int32_t transfer_block_num = i;
-    for (int j = 0; j < 2*transfer_block_num; j = j+2) {
-      int32_t block_id = j;
-      h2d_transfer_infos.emplace_back(
-          BlockTransferInfo(block_id,
-                            block_id,
-                            buffer,
-                            TransferType::H2D));
-      if (profile_with_d2h) {
-        d2h_transfer_infos.emplace_back(
-            BlockTransferInfo(block_id+1,
-                              block_id+1,
-                              buffer,
-                              TransferType::D2G));
+    h2d_transfer_infos.reserve(i);
+    d2h_transfer_infos.reserve(i);
+
+    const int32_t h2d_block_num = i;
+    const int32_t d2h_block_num =
+        fixed_d2h_blocks > 0 ? fixed_d2h_blocks : h2d_block_num;
+    const int32_t max_block_num =
+        std::max(h2d_block_num, profile_with_d2h ? d2h_block_num : 0);
+
+    for (int j = 0; j < 2 * max_block_num; j += 2) {
+      const int32_t block_id = j;
+      const int32_t block_index = j / 2;
+      if (profile_with_h2d && block_index < h2d_block_num) {
+        h2d_transfer_infos.emplace_back(
+            BlockTransferInfo(block_id, block_id, buffer, TransferType::H2D));
+      }
+      if (profile_with_d2h && block_index < d2h_block_num) {
+        // In concurrent mode, avoid reusing the exact same block as H2D.
+        // In D2H-only mode, use the same block_id sequence.
+        const int32_t d2h_block_id = profile_with_h2d ? block_id + 1 : block_id;
+        d2h_transfer_infos.emplace_back(BlockTransferInfo(
+            d2h_block_id, d2h_block_id, buffer, TransferType::D2G));
       }
     }
-    int32_t batch_id = i;
-    // if (profile_with_d2h) {
-    //   engine_->transfer_kv_blocks(0, batch_id, std::move(d2h_transfer_infos));
-    // }
-    engine_->transfer_kv_blocks(0, batch_id, std::move(h2d_transfer_infos));
+
+    const int32_t batch_id = i;
+    if (profile_with_h2d) {
+      engine_->transfer_kv_blocks(0, batch_id, std::move(h2d_transfer_infos));
+    }
     if (profile_with_d2h) {
       engine_->transfer_kv_blocks(0, batch_id, std::move(d2h_transfer_infos));
     }
     absl::SleepFor(absl::Milliseconds(1000));
   }
-
-  // engine_->transfer_kv_blocks(i, batches->at(i).batch_id(),
-  //                                   std::move(load_block_transfer_infos_[i]));
-
+  LOG(INFO) << "Finished host-device transfer profiling. profile_with_h2d="
+            << profile_with_h2d
+            << ", profile_with_d2h=" << profile_with_d2h
+            << ", fixed_d2h_blocks=" << fixed_d2h_blocks;
 }
 
 }  // namespace xllm

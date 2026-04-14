@@ -145,6 +145,7 @@ uint32_t HierarchyKVCacheTransfer::offload_kv_blocks(
   if (block_transfer_info.empty()) {
     return 0;
   }
+  const absl::Time batch_start_time = absl::Now();
 
   const int64_t num_layers = options_.layers();
   uint32_t max_blocks_per_batch =
@@ -192,6 +193,10 @@ uint32_t HierarchyKVCacheTransfer::offload_kv_blocks(
       LOG(FATAL) << "Future execution failed: " << e.what();
     }
   }
+  const double batch_latency =
+      absl::ToDoubleMilliseconds(absl::Now() - batch_start_time);
+  LOG(INFO) << "D2H batch:" << block_transfer_info.size()
+            << " copy total latency(ms): " << batch_latency;
 
   return block_transfer_info.size();
 }

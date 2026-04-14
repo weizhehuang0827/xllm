@@ -68,14 +68,16 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
   }
 #endif
 
-  if (options.profile_h2d_time()) {
+  if (options.profile_h2d_time() || options.profile_d2h_time()) {
     profile_swap_time();
   }
 }
 
 void ProfileManager::profile_swap_time() {
   block_manager_pool_->transfer_host_block_only(
-      options_.profile_h2d_time_with_d2h());
+      options_.profile_h2d_time(),
+      options_.profile_d2h_time() || options_.profile_h2d_time_with_d2h(),
+      options_.profile_fixed_d2h_blocks());
 }
     
 // --------------------- for test only ---------------------------

@@ -78,6 +78,8 @@ std::string Options::to_string() const {
      << ", enable_multi_stream_parallel: " << enable_multi_stream_parallel()
      << ", profile_h2d_time: " << profile_h2d_time()
      << ", profile_h2d_time_with_d2h: " << profile_h2d_time_with_d2h()
+     << ", profile_d2h_time: " << profile_d2h_time()
+     << ", profile_fixed_d2h_blocks: " << profile_fixed_d2h_blocks()
      << ", disable_ttft_profiling: " << disable_ttft_profiling()
      << ", enable_forward_interruption: " << enable_forward_interruption()
      << ", enable_graph: " << enable_graph()

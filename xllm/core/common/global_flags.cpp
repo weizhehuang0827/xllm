@@ -260,6 +260,14 @@ DEFINE_bool(profile_h2d_time_with_d2h,
             "Whether to launch same-size D2H copies alongside H2D when "
             "profiling H2D time.");
 
+DEFINE_bool(profile_d2h_time, false, "Whether to enable D2H copy time profiling.");
+
+DEFINE_int32(profile_fixed_d2h_blocks,
+             -1,
+             "Fixed D2H block count used in host-device profile when "
+             "profile_h2d_time_with_d2h is enabled. -1 means follow H2D "
+             "batch size.");
+
 DEFINE_bool(enable_latency_aware_schedule,
             false,
             "use predicted latency for latency aware schedule.");

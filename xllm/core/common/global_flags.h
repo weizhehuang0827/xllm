@@ -223,6 +223,10 @@ DECLARE_bool(profile_h2d_time);
 
 DECLARE_bool(profile_h2d_time_with_d2h);
 
+DECLARE_bool(profile_d2h_time);
+
+DECLARE_int32(profile_fixed_d2h_blocks);
+
 DECLARE_bool(enable_latency_aware_schedule);
 
 DECLARE_int32(profile_max_prompt_length);
