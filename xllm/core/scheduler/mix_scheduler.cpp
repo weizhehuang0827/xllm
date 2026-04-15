@@ -249,11 +249,13 @@ void MixScheduler::handle_running_queue_requests(
     double& estimate_latency,
     size_t& remaining_token_budget,
     size_t& remaining_seq_budget,
+    size_t& remaining_copy_blocks_budget_after_h2d,
     size_t& num_preempted_requests,
     std::vector<Sequence*>& prefill_stage_sequences,
     std::list<std::shared_ptr<Request>>& running_queue,
     bool& budget_exhausted,
     bool& blocks_exhausted) {
+  remaining_copy_blocks_budget_after_h2d = 0;
   if (running_queue.empty()) {
     return;
   }
@@ -482,6 +484,7 @@ void MixScheduler::handle_running_queue_requests(
     running_queue.push_back(request);
     preempted_request_vec.pop_back();
   }
+  remaining_copy_blocks_budget_after_h2d = remaining_copy_blocks_budget;
 }
 
 std::vector<Batch> MixScheduler::prepare_batch() {
@@ -559,6 +562,7 @@ std::vector<Batch> MixScheduler::prepare_batch() {
                                       ? profile_manager_->get_token_budget()
                                       : options_.max_tokens_per_batch();
   size_t remaining_seq_budget = options_.max_seqs_per_batch();
+  size_t remaining_copy_blocks_budget_after_h2d = 0;
   size_t num_preempted_requests = 0;
   bool budget_exhausted = false;
   bool blocks_exhausted = false;
@@ -569,6 +573,7 @@ std::vector<Batch> MixScheduler::prepare_batch() {
                                 estimate_latency,
                                 remaining_token_budget,
                                 remaining_seq_budget,
+                                remaining_copy_blocks_budget_after_h2d,
                                 num_preempted_requests,
                                 prefill_stage_sequences,
                                 running_queue_,
@@ -591,13 +596,88 @@ std::vector<Batch> MixScheduler::prepare_batch() {
 
   if (!is_batches_empty && FLAGS_n_off > 0 && enable_prefix_cache_ &&
       FLAGS_host_blocks_factor > 1.0) {
-    for (const auto& request : running_requests_) {
-      auto& sequence = request->sequences()[0];
-      kv_cache_manager_->enqueue_running_d2h_blocks(sequence.get());
-    }
-    for (const auto& request : running_queue_) {
-      auto& sequence = request->sequences()[0];
-      kv_cache_manager_->enqueue_running_d2h_blocks(sequence.get());
+    if (FLAGS_enable_mix_scheduler_budgeted_tail_d2h) {
+      // Use remaining H2D copy budget to drive D2H enqueue budget.
+      const int32_t clamped_h2d_remaining = static_cast<int32_t>(
+          std::min(remaining_copy_blocks_budget_after_h2d,
+                   static_cast<size_t>(std::numeric_limits<int32_t>::max())));
+      const int64_t scaled_d2h_budget =
+          static_cast<int64_t>(clamped_h2d_remaining) * 2;
+      int32_t remaining_d2h_blocks_budget = static_cast<int32_t>(
+          std::min(scaled_d2h_budget,
+                   static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+      const size_t block_size = kv_cache_manager_->block_size();
+      auto enqueue_d2h_with_budget =
+          [&](const std::shared_ptr<Request>& request) -> bool {
+        auto& sequence = request->sequences()[0];
+        if (sequence->stage() == SequenceStage::PREFILL) {
+          return true;
+        }
+        const size_t host_blocks_num =
+            sequence->host_kv_state().kv_cache_tokens_num() / block_size;
+        const size_t device_blocks_num =
+            sequence->kv_state().kv_cache_tokens_num() / block_size;
+        size_t needed_d2h_blocks = device_blocks_num > host_blocks_num
+                                       ? device_blocks_num - host_blocks_num
+                                       : 0;
+        if (needed_d2h_blocks == 0) {
+          return true;
+        }
+        if (FLAGS_n_off > 0 &&
+            needed_d2h_blocks < static_cast<size_t>(FLAGS_n_off)) {
+          return true;
+        }
+        const size_t budget_blocks =
+            static_cast<size_t>(remaining_d2h_blocks_budget);
+        const size_t requested_blocks =
+            std::min(needed_d2h_blocks, budget_blocks);
+        if (requested_blocks == 0) {
+          return false;
+        }
+        const size_t enqueued_blocks =
+            kv_cache_manager_->enqueue_running_d2h_blocks(sequence.get(),
+                                                          requested_blocks);
+        remaining_d2h_blocks_budget -= static_cast<int32_t>(std::min(
+            enqueued_blocks, static_cast<size_t>(remaining_d2h_blocks_budget)));
+        return true;
+      };
+
+      // Tail-first over unscheduled requests first.
+      for (auto it = running_queue_.rbegin();
+           it != running_queue_.rend() && remaining_d2h_blocks_budget > 0;
+           ++it) {
+        if (!enqueue_d2h_with_budget(*it)) {
+          break;
+        }
+      }
+      // Then tail-first over scheduled requests.
+      for (auto it = running_requests_.rbegin();
+           it != running_requests_.rend() && remaining_d2h_blocks_budget > 0;
+           ++it) {
+        if (!enqueue_d2h_with_budget(*it)) {
+          break;
+        }
+      }
+    } else {
+      // Fallback policy: enqueue per request in tail-first order.
+      for (auto it = running_queue_.rbegin(); it != running_queue_.rend();
+           ++it) {
+        auto& request = *it;
+        auto& sequence = request->sequences()[0];
+        if (sequence->stage() == SequenceStage::PREFILL) {
+          continue;
+        }
+        kv_cache_manager_->enqueue_running_d2h_blocks(sequence.get());
+      }
+      for (auto it = running_requests_.rbegin(); it != running_requests_.rend();
+           ++it) {
+        auto& request = *it;
+        auto& sequence = request->sequences()[0];
+        if (sequence->stage() == SequenceStage::PREFILL) {
+          continue;
+        }
+        kv_cache_manager_->enqueue_running_d2h_blocks(sequence.get());
+      }
     }
   }
 

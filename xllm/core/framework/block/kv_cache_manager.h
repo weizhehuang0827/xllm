@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <limits>
 #include <vector>
 
 #include "common/macros.h"
@@ -36,7 +37,13 @@ class KVCacheManager {
 
   virtual void transfer_blocks(std::vector<Batch>& batches) {};
   virtual void transfer_blocks() {};
-  virtual void enqueue_running_d2h_blocks(Sequence* sequence) {};
+  virtual size_t enqueue_running_d2h_blocks(
+      Sequence* sequence,
+      size_t max_offload_blocks = std::numeric_limits<size_t>::max()) {
+    (void)sequence;
+    (void)max_offload_blocks;
+    return 0;
+  };
 
   virtual void prefetch_from_storage(std::shared_ptr<Request>& request) {};
 

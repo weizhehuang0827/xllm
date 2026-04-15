@@ -54,6 +54,7 @@ class MixScheduler : public ChunkedPrefillScheduler {
       double& estimate_latency,
       size_t& remaining_token_budget,
       size_t& remaining_seq_budget,
+      size_t& remaining_copy_blocks_budget_after_h2d,
       size_t& num_preempted_requests,
       std::vector<Sequence*>& prefill_stage_sequences,
       std::list<std::shared_ptr<Request>>& running_queue,

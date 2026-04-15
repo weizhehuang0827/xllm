@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <limits>
+
 #include "block_manager_pool.h"
 #include "distributed_runtime/engine.h"
 #include "util/blockingconcurrentqueue.h"
@@ -70,7 +72,9 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   void allocate_shared(Sequence* sequence) override;
 
   void deallocate(Sequence* sequence) override;
-  void enqueue_running_d2h_blocks(Sequence* sequence) override;
+  size_t enqueue_running_d2h_blocks(
+      Sequence* sequence,
+      size_t max_offload_blocks = std::numeric_limits<size_t>::max()) override;
 
   void transfer_blocks(std::vector<Batch>& batches) override;
   void transfer_blocks() override;

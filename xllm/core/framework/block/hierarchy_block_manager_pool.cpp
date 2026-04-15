@@ -108,19 +108,21 @@ void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
   sequence->reset();
 }
 
-void HierarchyBlockManagerPool::enqueue_running_d2h_blocks(Sequence* sequence) {
+size_t HierarchyBlockManagerPool::enqueue_running_d2h_blocks(
+    Sequence* sequence,
+    size_t max_offload_blocks) {
   DCHECK(sequence != nullptr);
 
   // Running D2H offload is only enabled when prefix cache is on and
   // host capacity is expanded (host_blocks_factor > 1).
   if (!options_.enable_prefix_cache() ||
       options_.host_num_blocks() <= options_.num_blocks()) {
-    return;
+    return 0;
   }
 
   // Keep pure prefill behavior unchanged; allow CHUNKED_PREFILL to offload.
   if (sequence->stage() == SequenceStage::PREFILL) {
-    return;
+    return 0;
   }
 
   int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
@@ -128,7 +130,7 @@ void HierarchyBlockManagerPool::enqueue_running_d2h_blocks(Sequence* sequence) {
   auto* host_blocks = sequence->host_kv_state().mutable_kv_blocks();
 
   if (blocks->empty()) {
-    return;
+    return 0;
   }
 
   size_t cached_host_block_num =
@@ -136,13 +138,18 @@ void HierarchyBlockManagerPool::enqueue_running_d2h_blocks(Sequence* sequence) {
   size_t cached_device_block_num =
       sequence->kv_state().kv_cache_tokens_num() / options_.block_size();
   if (cached_device_block_num <= cached_host_block_num) {
-    return;
+    return 0;
   }
   const size_t needed_offload_num =
       cached_device_block_num - cached_host_block_num;
   if (FLAGS_n_off > 0 &&
       needed_offload_num < static_cast<size_t>(FLAGS_n_off)) {
-    return;
+    return 0;
+  }
+  const size_t target_offload_num =
+      std::min(needed_offload_num, max_offload_blocks);
+  if (target_offload_num == 0) {
+    return 0;
   }
 
   if (host_blocks->size() < cached_device_block_num) {
@@ -152,10 +159,12 @@ void HierarchyBlockManagerPool::enqueue_running_d2h_blocks(Sequence* sequence) {
         host_block_managers_[dp_rank]->allocate(needed_block_num));
   }
 
-  size_t offload_end = std::min(cached_device_block_num, host_blocks->size());
+  size_t offload_end = cached_host_block_num + target_offload_num;
+  offload_end = std::min(offload_end, cached_device_block_num);
+  offload_end = std::min(offload_end, host_blocks->size());
   offload_end = std::min(offload_end, blocks->size());
   if (offload_end <= cached_host_block_num) {
-    return;
+    return 0;
   }
 
   for (size_t i = cached_host_block_num; i < offload_end; i++) {
@@ -171,6 +180,7 @@ void HierarchyBlockManagerPool::enqueue_running_d2h_blocks(Sequence* sequence) {
   if (sequence->host_kv_state().kv_cache_tokens_num() < host_cache_tokens_num) {
     sequence->host_kv_state().set_kv_cache_tokens_num(host_cache_tokens_num);
   }
+  return offload_end - cached_host_block_num;
 }
 
 bool HierarchyBlockManagerPool::allocate(Sequence* sequence,

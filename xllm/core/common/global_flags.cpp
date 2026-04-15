@@ -489,6 +489,12 @@ DEFINE_bool(enable_control_h2d_block_num,
             false,
             "Whether to control h2d copy block num.");
 
+DEFINE_bool(
+    enable_mix_scheduler_budgeted_tail_d2h,
+    false,
+    "Whether to enable MixScheduler D2H enqueue policy driven by remaining "
+    "H2D copy budget (scaled by 1.5) and tail-first request traversal.");
+
 // --- computation communication parallel config ---
 
 DEFINE_bool(

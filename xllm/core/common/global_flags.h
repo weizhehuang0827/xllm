@@ -213,6 +213,8 @@ DECLARE_bool(enable_kvcache_store);
 
 DECLARE_bool(enable_control_h2d_block_num);
 
+DECLARE_bool(enable_mix_scheduler_budgeted_tail_d2h);
+
 DECLARE_string(store_protocol);
 
 DECLARE_string(store_master_server_address);
