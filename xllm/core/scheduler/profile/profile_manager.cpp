@@ -523,7 +523,7 @@ ProfileManager::get_copy_block_profile() {
       // offline copy block profile
       // {"Qwen2-7B", 128, -1, 0.48, 0.24, "Qwen2-7B, block_size=128"},
       // {"Qwen2-7B", 128, -1, 0.36, 0.74, "Qwen2-7B, block_size=128"},
-      {"Qwen2-7B", 128, -1, 100, 0.74, "Qwen2-7B, block_size=128"},
+      {"Qwen2-7B", 128, -1, 0.48, 0.74, "Qwen2-7B, block_size=128"},
       {"Qwen2-7B", 64, -1, 0.20, 0.25, "Qwen2-7B, block_size=64"},
       {"Qwen3-32B", 128, 2, 0.972, 0.14, "Qwen3-32B, block_size=128, tp=2"},
       {"Qwen3-32B", 128, 4, 0.588, 0.14, "Qwen3-32B, block_size=128, tp=4"},

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <limits>
+#include <sstream>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -196,7 +197,8 @@ size_t MixScheduler::get_needed_copy_block_num(
 
 size_t MixScheduler::get_max_copy_block_num(
     std::list<std::shared_ptr<Request>>& running_queue,
-    double& latency_budget) {
+    double& latency_budget,
+    int32_t* h2d_copy_case) {
   double min_total_exec_time = profile_manager_->get_constant_overhead();
   size_t max_h2d_block_num = 0;
   auto block_size = kv_cache_manager_->block_size();
@@ -224,6 +226,9 @@ size_t MixScheduler::get_max_copy_block_num(
   }
   size_t max_copy_block_num = std::numeric_limits<int32_t>::max();
   if (min_total_exec_time >= latency_budget) {
+    if (h2d_copy_case != nullptr) {
+      *h2d_copy_case = 1;
+    }
     // case 1: use latency budget to determine copy total blocks num
     max_copy_block_num =
         profile_manager_->get_max_copy_block_num(latency_budget);
@@ -231,6 +236,9 @@ size_t MixScheduler::get_max_copy_block_num(
     double max_h2d_transfer_time =
         profile_manager_->predict_copy_blocks_time(max_h2d_block_num);
     if (max_h2d_transfer_time > min_total_exec_time) {
+      if (h2d_copy_case != nullptr) {
+        *h2d_copy_case = 2;
+      }
       // case2: compute to determine need copy total blocks num
       max_copy_block_num = get_needed_copy_block_num(req_vec,
                                                      req_copy_block_num_vec,
@@ -238,6 +246,9 @@ size_t MixScheduler::get_max_copy_block_num(
                                                      min_total_exec_time,
                                                      max_h2d_block_num);
     } else {
+      if (h2d_copy_case != nullptr) {
+        *h2d_copy_case = 3;
+      }
       // case 3: copy all blocks
     }
   }
@@ -250,12 +261,22 @@ void MixScheduler::handle_running_queue_requests(
     size_t& remaining_token_budget,
     size_t& remaining_seq_budget,
     size_t& remaining_copy_blocks_budget_after_h2d,
+    size_t& h2d_copy_demand_blocks,
+    size_t& h2d_copy_cap_blocks,
+    size_t& h2d_copy_limited_blocks,
+    int32_t& h2d_copy_case,
     size_t& num_preempted_requests,
+    size_t& num_partial_copy_skipped_requests,
     std::vector<Sequence*>& prefill_stage_sequences,
     std::list<std::shared_ptr<Request>>& running_queue,
     bool& budget_exhausted,
     bool& blocks_exhausted) {
   remaining_copy_blocks_budget_after_h2d = 0;
+  h2d_copy_demand_blocks = 0;
+  h2d_copy_cap_blocks = 0;
+  h2d_copy_limited_blocks = 0;
+  h2d_copy_case = 0;
+  num_partial_copy_skipped_requests = 0;
   if (running_queue.empty()) {
     return;
   }
@@ -265,8 +286,10 @@ void MixScheduler::handle_running_queue_requests(
   size_t remaining_copy_blocks_budget =
       (options_.enable_latency_aware_schedule() &&
        FLAGS_enable_control_h2d_block_num)
-          ? get_max_copy_block_num(running_queue, latency_budget)
+          ? get_max_copy_block_num(
+                running_queue, latency_budget, &h2d_copy_case)
           : std::numeric_limits<int32_t>::max();
+  h2d_copy_cap_blocks = remaining_copy_blocks_budget;
 
   std::vector<std::shared_ptr<Request>> preempted_request_vec;
   bool is_preempt_iterator_valid = true;
@@ -294,7 +317,10 @@ void MixScheduler::handle_running_queue_requests(
     size_t allocated_tokens = 0;
     size_t allocated_seqs = 0;
     double allocated_estimate_latency = 0;
+    size_t allocated_copy_demand_blocks = 0;
     size_t allocated_copy_blocks = 0;
+    size_t allocated_copy_limited_blocks = 0;
+    bool skip_request_for_partial_copy = false;
     for (auto& sequence : request->sequences()) {
       // skip finished sequence.
       if (sequence->finished()) {
@@ -308,12 +334,19 @@ void MixScheduler::handle_running_queue_requests(
           sequence->host_kv_state().kv_cache_tokens_num() / block_size;
       size_t device_blocks_num =
           sequence->kv_state().kv_cache_tokens_num() / block_size;
-      size_t cur_step_copy_blocks = host_blocks_num > device_blocks_num
-                                        ? host_blocks_num - device_blocks_num
-                                        : 0;
-      cur_step_copy_blocks =
-          std::min(cur_step_copy_blocks,
-                   remaining_copy_blocks_budget - allocated_copy_blocks);
+      const size_t full_step_copy_blocks =
+          host_blocks_num > device_blocks_num
+              ? host_blocks_num - device_blocks_num
+              : 0;
+      const size_t remaining_copy_budget_for_request =
+          remaining_copy_blocks_budget - allocated_copy_blocks;
+      const size_t cur_step_copy_blocks =
+          std::min(full_step_copy_blocks, remaining_copy_budget_for_request);
+      const bool partial_copy_due_to_budget =
+          cur_step_copy_blocks < full_step_copy_blocks;
+      allocated_copy_demand_blocks += full_step_copy_blocks;
+      allocated_copy_limited_blocks +=
+          (full_step_copy_blocks - cur_step_copy_blocks);
       size_t kv_cache_tokens_num =
           cur_step_copy_blocks == 0
               ? sequence->kv_state().kv_cache_tokens_num()
@@ -338,7 +371,11 @@ void MixScheduler::handle_running_queue_requests(
               kv_cache_tokens_num,
               static_cast<int32_t>(latency_budget - estimate_latency));
           if (assume_max_tokens == kv_cache_tokens_num) {
-            budget_exhausted = true;
+            if (partial_copy_due_to_budget) {
+              skip_request_for_partial_copy = true;
+            } else {
+              budget_exhausted = true;
+            }
             break;
           }
           if (assume_max_tokens != num_tokens &&
@@ -357,7 +394,11 @@ void MixScheduler::handle_running_queue_requests(
               num_tokens, kv_cache_tokens_num, false);
           if (estimate_latency + allocated_estimate_latency > latency_budget) {
             // slack is too small, even decode is unable to include
-            budget_exhausted = true;
+            if (partial_copy_due_to_budget) {
+              skip_request_for_partial_copy = true;
+            } else {
+              budget_exhausted = true;
+            }
             break;
           }
         }
@@ -393,6 +434,14 @@ void MixScheduler::handle_running_queue_requests(
       candidate_sequences.emplace_back(sequence.get());
       candidate_token_budgets.emplace_back(current_step_handle_tokens);
     }
+    if (skip_request_for_partial_copy) {
+      ++num_partial_copy_skipped_requests;
+      running_queue.pop_front();
+      // Keep skipped requests out of this scheduling round to avoid
+      // reprocessing loops, then append them back to the queue tail later.
+      preempted_request_vec.push_back(request);
+      continue;
+    }
     if (!blocks_exhausted && !budget_exhausted) {
       // remove the request from the priority queue
       running_queue.pop_front();
@@ -407,6 +456,8 @@ void MixScheduler::handle_running_queue_requests(
       remaining_token_budget -= allocated_tokens;
       remaining_seq_budget -= allocated_seqs;
       remaining_copy_blocks_budget -= allocated_copy_blocks;
+      h2d_copy_demand_blocks += allocated_copy_demand_blocks;
+      h2d_copy_limited_blocks += allocated_copy_limited_blocks;
       estimate_latency += allocated_estimate_latency;
       continue;
     }
@@ -563,7 +614,12 @@ std::vector<Batch> MixScheduler::prepare_batch() {
                                       : options_.max_tokens_per_batch();
   size_t remaining_seq_budget = options_.max_seqs_per_batch();
   size_t remaining_copy_blocks_budget_after_h2d = 0;
+  size_t h2d_copy_demand_blocks = 0;
+  size_t h2d_copy_cap_blocks = 0;
+  size_t h2d_copy_limited_blocks = 0;
+  int32_t h2d_copy_case = 0;
   size_t num_preempted_requests = 0;
+  size_t num_partial_copy_skipped_requests = 0;
   bool budget_exhausted = false;
   bool blocks_exhausted = false;
   // keep the requests in prefill stage
@@ -574,7 +630,12 @@ std::vector<Batch> MixScheduler::prepare_batch() {
                                 remaining_token_budget,
                                 remaining_seq_budget,
                                 remaining_copy_blocks_budget_after_h2d,
+                                h2d_copy_demand_blocks,
+                                h2d_copy_cap_blocks,
+                                h2d_copy_limited_blocks,
+                                h2d_copy_case,
                                 num_preempted_requests,
+                                num_partial_copy_skipped_requests,
                                 prefill_stage_sequences,
                                 running_queue_,
                                 budget_exhausted,
@@ -693,6 +754,35 @@ std::vector<Batch> MixScheduler::prepare_batch() {
             pending_requests_.load(std::memory_order_relaxed));
   GAUGE_SET(num_running_requests, running_requests_.size());
   GAUGE_SET(num_preempted_requests, num_preempted_requests);
+
+  if (h2d_copy_case != 0 && h2d_copy_demand_blocks > 0) {
+    std::string h2d_case_str = "case3";
+    if (h2d_copy_case == 1) {
+      h2d_case_str = "case1";
+    } else if (h2d_copy_case == 2) {
+      h2d_case_str = "case2";
+    }
+    const size_t non_empty_batches = std::count_if(
+        batches.begin(), batches.end(), [](const Batch& one_batch) {
+          return !one_batch.empty();
+        });
+    std::ostringstream h2d_control_log;
+    h2d_control_log << "[h2d_control_round] h2d_case=" << h2d_case_str
+                    << ", h2d_case_id=" << h2d_copy_case;
+    h2d_control_log << ", actual_h2d_copy_demand_blocks="
+                    << h2d_copy_demand_blocks
+                    << ", h2d_copy_cap_blocks=" << h2d_copy_cap_blocks
+                    << ", actual_h2d_copy_limited_blocks="
+                    << h2d_copy_limited_blocks << ", partial_copy_skipped="
+                    << num_partial_copy_skipped_requests
+                    << ", scheduled_requests=" << running_requests_.size()
+                    << ", scheduled_sequences=" << running_sequences_.size()
+                    << ", queue_remaining=" << running_queue_.size()
+                    << ", non_empty_batches=" << non_empty_batches
+                    << ", batches_empty=" << is_batches_empty;
+    LOG(INFO) << h2d_control_log.str();
+  }
+
   if (num_preempted_requests > 0) {
     const size_t non_empty_batches = std::count_if(
         batches.begin(), batches.end(), [](const Batch& one_batch) {

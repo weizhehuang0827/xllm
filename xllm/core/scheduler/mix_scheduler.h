@@ -55,7 +55,12 @@ class MixScheduler : public ChunkedPrefillScheduler {
       size_t& remaining_token_budget,
       size_t& remaining_seq_budget,
       size_t& remaining_copy_blocks_budget_after_h2d,
+      size_t& h2d_copy_demand_blocks,
+      size_t& h2d_copy_cap_blocks,
+      size_t& h2d_copy_limited_blocks,
+      int32_t& h2d_copy_case,
       size_t& num_preempted_requests,
+      size_t& num_partial_copy_skipped_requests,
       std::vector<Sequence*>& prefill_stage_sequences,
       std::list<std::shared_ptr<Request>>& running_queue,
       bool& budget_exhausted,
@@ -71,7 +76,8 @@ class MixScheduler : public ChunkedPrefillScheduler {
                         bool use_quadratic_formula = false);
   size_t get_max_copy_block_num(
       std::list<std::shared_ptr<Request>>& running_queue,
-      double& latency_budget);
+      double& latency_budget,
+      int32_t* h2d_copy_case = nullptr);
 
   size_t get_needed_copy_block_num(
       std::vector<std::shared_ptr<Request>>& req_vec,
