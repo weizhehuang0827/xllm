@@ -110,6 +110,14 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   size_t transfer_profile_d2h_blocks_window_max_ = 0;
   size_t transfer_profile_h2d_blocks_total_max_ = 0;
   size_t transfer_profile_d2h_blocks_total_max_ = 0;
+  size_t transfer_profile_d2h_blocks_actual_total_ = 0;
+  size_t transfer_profile_d2h_blocks_actual_window_ = 0;
+  size_t transfer_profile_d2h_blocks_actual_window_max_ = 0;
+  size_t transfer_profile_d2h_blocks_actual_total_max_ = 0;
+  size_t transfer_profile_d2h_blocks_synthetic_total_ = 0;
+  size_t transfer_profile_d2h_blocks_synthetic_window_ = 0;
+  size_t transfer_profile_d2h_blocks_synthetic_window_max_ = 0;
+  size_t transfer_profile_d2h_blocks_synthetic_total_max_ = 0;
   size_t transfer_profile_window_steps_ = 0;
 };
 

@@ -111,6 +111,7 @@ const OptionCategory kOtherOptions = {
      "h2d_overlap_profile_log_interval",
      "enable_layer_exec_profile",
      "layer_exec_profile_log_interval",
+     "enable_fake_d2h_no_copy",
      "use_contiguous_input_buffer",
      "use_audio_in_video"}};
 

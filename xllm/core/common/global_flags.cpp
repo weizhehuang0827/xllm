@@ -495,6 +495,11 @@ DEFINE_bool(
     "Whether to enable MixScheduler D2H enqueue policy driven by remaining "
     "H2D copy budget (scaled by 1.5) and tail-first request traversal.");
 
+DEFINE_bool(enable_fake_d2h_no_copy,
+            false,
+            "Skip actual D2H transfer but keep post-transfer bookkeeping "
+            "(host cache/deallocate) for ablation.");
+
 // --- computation communication parallel config ---
 
 DEFINE_bool(

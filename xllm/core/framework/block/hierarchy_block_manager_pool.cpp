@@ -399,6 +399,8 @@ void HierarchyBlockManagerPool::transfer_blocks() {
 
 size_t HierarchyBlockManagerPool::transfer_offload_blocks() {
   size_t step_d2h_blocks = 0;
+  size_t step_d2h_blocks_actual = 0;
+  size_t step_d2h_blocks_synthetic = 0;
   // offload blocks from device to host and kvcache store
   for (int i = 0; i < offload_block_pair_queues_.size(); i++) {
     std::vector<BlockTransferInfo> release_transfer_infos;
@@ -432,6 +434,29 @@ size_t HierarchyBlockManagerPool::transfer_offload_blocks() {
 
     step_d2h_blocks += release_transfer_infos.size();
     step_d2h_blocks += keep_transfer_infos.size();
+    if (FLAGS_enable_fake_d2h_no_copy) {
+      step_d2h_blocks_synthetic += release_transfer_infos.size();
+      step_d2h_blocks_synthetic += keep_transfer_infos.size();
+    } else {
+      step_d2h_blocks_actual += release_transfer_infos.size();
+      step_d2h_blocks_actual += keep_transfer_infos.size();
+    }
+
+    if (FLAGS_enable_fake_d2h_no_copy) {
+      // Fake D2H mode: skip actual copy but keep successful-offload
+      // bookkeeping to make host blocks reusable for subsequent H2D.
+      if (!release_src_blocks.empty()) {
+        block_managers_[i]->deallocate({release_src_blocks});
+      }
+      if (!release_dst_blocks.empty()) {
+        host_block_managers_[i]->cache(release_dst_blocks);
+        host_block_managers_[i]->deallocate({release_dst_blocks});
+      }
+      if (!keep_dst_blocks.empty()) {
+        host_block_managers_[i]->cache(keep_dst_blocks);
+      }
+      continue;
+    }
 
     if (!release_transfer_infos.empty()) {
       folly::collectAll(std::move(engine_->transfer_kv_blocks(
@@ -482,6 +507,20 @@ size_t HierarchyBlockManagerPool::transfer_offload_blocks() {
           });
     }
   }
+  transfer_profile_d2h_blocks_actual_total_ += step_d2h_blocks_actual;
+  transfer_profile_d2h_blocks_actual_window_ += step_d2h_blocks_actual;
+  transfer_profile_d2h_blocks_actual_window_max_ = std::max(
+      transfer_profile_d2h_blocks_actual_window_max_, step_d2h_blocks_actual);
+  transfer_profile_d2h_blocks_actual_total_max_ = std::max(
+      transfer_profile_d2h_blocks_actual_total_max_, step_d2h_blocks_actual);
+  transfer_profile_d2h_blocks_synthetic_total_ += step_d2h_blocks_synthetic;
+  transfer_profile_d2h_blocks_synthetic_window_ += step_d2h_blocks_synthetic;
+  transfer_profile_d2h_blocks_synthetic_window_max_ =
+      std::max(transfer_profile_d2h_blocks_synthetic_window_max_,
+               step_d2h_blocks_synthetic);
+  transfer_profile_d2h_blocks_synthetic_total_max_ =
+      std::max(transfer_profile_d2h_blocks_synthetic_total_max_,
+               step_d2h_blocks_synthetic);
   return step_d2h_blocks;
 }
 
@@ -522,6 +561,18 @@ void HierarchyBlockManagerPool::maybe_log_transfer_profile(
   const double avg_d2h_blocks_total =
       static_cast<double>(transfer_profile_d2h_blocks_total_) /
       transfer_profiled_steps_;
+  const double avg_d2h_blocks_actual_window =
+      static_cast<double>(transfer_profile_d2h_blocks_actual_window_) /
+      transfer_profile_window_steps_;
+  const double avg_d2h_blocks_actual_total =
+      static_cast<double>(transfer_profile_d2h_blocks_actual_total_) /
+      transfer_profiled_steps_;
+  const double avg_d2h_blocks_synthetic_window =
+      static_cast<double>(transfer_profile_d2h_blocks_synthetic_window_) /
+      transfer_profile_window_steps_;
+  const double avg_d2h_blocks_synthetic_total =
+      static_cast<double>(transfer_profile_d2h_blocks_synthetic_total_) /
+      transfer_profiled_steps_;
 
   LOG(INFO)
       << "[transfer_block_profile] steps=" << transfer_profiled_steps_
@@ -539,12 +590,36 @@ void HierarchyBlockManagerPool::maybe_log_transfer_profile(
       << ", avg_h2d_blocks_total=" << avg_h2d_blocks_total
       << ", avg_d2h_blocks_total=" << avg_d2h_blocks_total
       << ", max_h2d_blocks_total=" << transfer_profile_h2d_blocks_total_max_
-      << ", max_d2h_blocks_total=" << transfer_profile_d2h_blocks_total_max_;
+      << ", max_d2h_blocks_total=" << transfer_profile_d2h_blocks_total_max_
+      << ", sum_d2h_blocks_actual_window="
+      << transfer_profile_d2h_blocks_actual_window_
+      << ", avg_d2h_blocks_actual_window=" << avg_d2h_blocks_actual_window
+      << ", max_d2h_blocks_actual_window="
+      << transfer_profile_d2h_blocks_actual_window_max_
+      << ", sum_d2h_blocks_actual_total="
+      << transfer_profile_d2h_blocks_actual_total_
+      << ", avg_d2h_blocks_actual_total=" << avg_d2h_blocks_actual_total
+      << ", max_d2h_blocks_actual_total="
+      << transfer_profile_d2h_blocks_actual_total_max_
+      << ", sum_d2h_blocks_synthetic_window="
+      << transfer_profile_d2h_blocks_synthetic_window_
+      << ", avg_d2h_blocks_synthetic_window=" << avg_d2h_blocks_synthetic_window
+      << ", max_d2h_blocks_synthetic_window="
+      << transfer_profile_d2h_blocks_synthetic_window_max_
+      << ", sum_d2h_blocks_synthetic_total="
+      << transfer_profile_d2h_blocks_synthetic_total_
+      << ", avg_d2h_blocks_synthetic_total=" << avg_d2h_blocks_synthetic_total
+      << ", max_d2h_blocks_synthetic_total="
+      << transfer_profile_d2h_blocks_synthetic_total_max_;
 
   transfer_profile_h2d_blocks_window_ = 0;
   transfer_profile_d2h_blocks_window_ = 0;
   transfer_profile_h2d_blocks_window_max_ = 0;
   transfer_profile_d2h_blocks_window_max_ = 0;
+  transfer_profile_d2h_blocks_actual_window_ = 0;
+  transfer_profile_d2h_blocks_actual_window_max_ = 0;
+  transfer_profile_d2h_blocks_synthetic_window_ = 0;
+  transfer_profile_d2h_blocks_synthetic_window_max_ = 0;
   transfer_profile_window_steps_ = 0;
 }
 
