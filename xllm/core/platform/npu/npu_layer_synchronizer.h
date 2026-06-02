@@ -31,7 +31,9 @@ class NPULayerSynchronizerImpl {
   aclrtEvent* get_event(const int64_t layer_index);
   std::atomic<bool>* get_event_flag(const int64_t layer_index);
   bool synchronize_layer(const int64_t layer_index);
-  void add_h2d_copy_time_us(int64_t layer_index, int64_t elapsed_us);
+  void add_h2d_copy_time_us(int64_t layer_index,
+                            int64_t elapsed_us,
+                            int64_t copy_blocks = 0);
   void set_layer_range(int64_t layer_index,
                        int64_t start_layer,
                        int64_t end_layer);
@@ -43,10 +45,12 @@ class NPULayerSynchronizerImpl {
   const int32_t timeout_;
 
   std::vector<std::atomic<int64_t>> h2d_copy_time_us_per_layer_;
+  std::vector<std::atomic<int64_t>> h2d_copy_blocks_per_layer_;
   std::vector<int64_t> layer_range_start_;
   std::vector<int64_t> layer_range_end_;
 
   std::atomic<int64_t> h2d_copy_time_us_{0};
+  std::atomic<int64_t> h2d_copy_blocks_{0};
 };
 
 }  // namespace xllm

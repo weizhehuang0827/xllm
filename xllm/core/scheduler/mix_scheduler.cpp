@@ -283,6 +283,7 @@ void MixScheduler::handle_running_queue_requests(
 
   get_latency_budget_and_request_order(running_queue, latency_budget);
 
+  const double partial_copy_effective_progress_beta = 1.5;
   size_t remaining_copy_blocks_budget =
       (options_.enable_latency_aware_schedule() &&
        FLAGS_enable_control_h2d_block_num)
@@ -330,8 +331,9 @@ void MixScheduler::handle_running_queue_requests(
       // support kv cache swapping between host and device and try to overlap
       // the computation and copy overhead.
       auto block_size = kv_cache_manager_->block_size();
-      size_t host_blocks_num =
-          sequence->host_kv_state().kv_cache_tokens_num() / block_size;
+      const size_t host_kv_tokens_num =
+          sequence->host_kv_state().kv_cache_tokens_num();
+      size_t host_blocks_num = host_kv_tokens_num / block_size;
       size_t device_blocks_num =
           sequence->kv_state().kv_cache_tokens_num() / block_size;
       const size_t full_step_copy_blocks =
@@ -377,6 +379,25 @@ void MixScheduler::handle_running_queue_requests(
               budget_exhausted = true;
             }
             break;
+          }
+          if (partial_copy_due_to_budget) {
+            const size_t l_comp = assume_max_tokens - kv_cache_tokens_num;
+            const size_t limited_copy_blocks =
+                full_step_copy_blocks - cur_step_copy_blocks;
+            const bool reaches_max_computable_token_limit =
+                assume_max_tokens == num_tokens;
+            const double limited_copy_tokens =
+                static_cast<double>(limited_copy_blocks) *
+                static_cast<double>(block_size);
+            const bool has_sufficient_effective_progress =
+                reaches_max_computable_token_limit ||
+                (limited_copy_tokens > 0.0 &&
+                 static_cast<double>(l_comp) / limited_copy_tokens >
+                     partial_copy_effective_progress_beta);
+            if (!has_sufficient_effective_progress) {
+              skip_request_for_partial_copy = true;
+              break;
+            }
           }
           if (assume_max_tokens != num_tokens &&
               (assume_max_tokens - kv_cache_tokens_num) <= 50) {

@@ -291,6 +291,8 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
     return true;
   }
 
+  const int64_t h2d_copy_blocks =
+      static_cast<int64_t>(block_transfer_info.size());
   const int64_t num_layers = options_.layers();
   uint32_t layers_per_bacth_copy =
       num_layers / options_.layers_wise_copy_batchs();
@@ -395,7 +397,8 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
         std::chrono::duration_cast<std::chrono::microseconds>(layer_copy_end -
                                                               layer_copy_begin)
             .count();
-    synchronizer->add_h2d_copy_time_us(index, layer_copy_elapsed_us);
+    synchronizer->add_h2d_copy_time_us(
+        index, layer_copy_elapsed_us, h2d_copy_blocks);
     synchronizer->set_layer_range(index, start_layer_id, layer_id);
 
     auto* event_flag = synchronizer->get_event_flag(index);

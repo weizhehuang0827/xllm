@@ -78,10 +78,32 @@ std::mutex g_layer_exec_profiled_batch_idle_median_mutex;
 std::priority_queue<int64_t> g_layer_exec_profiled_batch_idle_lower;
 std::priority_queue<int64_t, std::vector<int64_t>, std::greater<int64_t>>
     g_layer_exec_profiled_batch_idle_upper;
+std::mutex g_layer_exec_profiled_batch_idle_samples_mutex;
+std::vector<int64_t> g_layer_exec_profiled_batch_idle_samples;
 std::mutex g_layer_exec_profiled_all_chunk_idle_median_mutex;
 std::priority_queue<int64_t> g_layer_exec_profiled_all_chunk_idle_lower;
 std::priority_queue<int64_t, std::vector<int64_t>, std::greater<int64_t>>
     g_layer_exec_profiled_all_chunk_idle_upper;
+std::mutex g_layer_exec_profiled_all_chunk_idle_samples_mutex;
+std::vector<int64_t> g_layer_exec_profiled_all_chunk_idle_samples;
+
+double get_sorted_quantile_us(const std::vector<int64_t>& sorted_values,
+                              double q) {
+  if (sorted_values.empty()) {
+    return 0.0;
+  }
+  const double clamped_q = std::max(0.0, std::min(1.0, q));
+  const double pos = (sorted_values.size() - 1) * clamped_q;
+  const size_t low_idx = static_cast<size_t>(std::floor(pos));
+  const size_t high_idx = static_cast<size_t>(std::ceil(pos));
+  if (low_idx == high_idx) {
+    return static_cast<double>(sorted_values[low_idx]);
+  }
+  const double low_v = static_cast<double>(sorted_values[low_idx]);
+  const double high_v = static_cast<double>(sorted_values[high_idx]);
+  const double frac = pos - low_idx;
+  return low_v + frac * (high_v - low_v);
+}
 }  // namespace
 
 template <typename DecoderType>
@@ -643,6 +665,11 @@ class LlmModelImplBase : public torch::nn::Module {
           g_layer_exec_profiled_batch_idle_upper.pop();
         }
       }
+      {
+        std::lock_guard<std::mutex> lock(
+            g_layer_exec_profiled_batch_idle_samples_mutex);
+        g_layer_exec_profiled_batch_idle_samples.push_back(batch_chunk_idle_us);
+      }
       // Track exact running median (p50) of all chunk idle values across all
       // profiled steps.
       {
@@ -667,6 +694,14 @@ class LlmModelImplBase : public torch::nn::Module {
             g_layer_exec_profiled_all_chunk_idle_upper.pop();
           }
         }
+      }
+      {
+        std::lock_guard<std::mutex> lock(
+            g_layer_exec_profiled_all_chunk_idle_samples_mutex);
+        g_layer_exec_profiled_all_chunk_idle_samples.insert(
+            g_layer_exec_profiled_all_chunk_idle_samples.end(),
+            chunk_idle_us_list.begin(),
+            chunk_idle_us_list.end());
       }
       const int64_t profiled_batches = g_layer_exec_profiled_batches.fetch_add(
                                            1, std::memory_order_relaxed) +
@@ -698,6 +733,10 @@ class LlmModelImplBase : public torch::nn::Module {
                 std::memory_order_relaxed);
         double p50_batch_idle_us_total = 0.0;
         bool has_p50_batch_idle_us_total = false;
+        double p75_batch_idle_us_total = 0.0;
+        bool has_p75_batch_idle_us_total = false;
+        double p99_batch_idle_us_total = 0.0;
+        bool has_p99_batch_idle_us_total = false;
         {
           std::lock_guard<std::mutex> lock(
               g_layer_exec_profiled_batch_idle_median_mutex);
@@ -717,8 +756,27 @@ class LlmModelImplBase : public torch::nn::Module {
             }
           }
         }
+        {
+          std::lock_guard<std::mutex> lock(
+              g_layer_exec_profiled_batch_idle_samples_mutex);
+          if (!g_layer_exec_profiled_batch_idle_samples.empty()) {
+            std::vector<int64_t> sorted_samples =
+                g_layer_exec_profiled_batch_idle_samples;
+            std::sort(sorted_samples.begin(), sorted_samples.end());
+            has_p75_batch_idle_us_total = true;
+            has_p99_batch_idle_us_total = true;
+            p75_batch_idle_us_total =
+                get_sorted_quantile_us(sorted_samples, 0.75);
+            p99_batch_idle_us_total =
+                get_sorted_quantile_us(sorted_samples, 0.99);
+          }
+        }
         double p50_all_chunk_idle_us_total = 0.0;
         bool has_p50_all_chunk_idle_us_total = false;
+        double p75_all_chunk_idle_us_total = 0.0;
+        bool has_p75_all_chunk_idle_us_total = false;
+        double p99_all_chunk_idle_us_total = 0.0;
+        bool has_p99_all_chunk_idle_us_total = false;
         {
           std::lock_guard<std::mutex> lock(
               g_layer_exec_profiled_all_chunk_idle_median_mutex);
@@ -736,6 +794,21 @@ class LlmModelImplBase : public torch::nn::Module {
               p50_all_chunk_idle_us_total = static_cast<double>(
                   g_layer_exec_profiled_all_chunk_idle_lower.top());
             }
+          }
+        }
+        {
+          std::lock_guard<std::mutex> lock(
+              g_layer_exec_profiled_all_chunk_idle_samples_mutex);
+          if (!g_layer_exec_profiled_all_chunk_idle_samples.empty()) {
+            std::vector<int64_t> sorted_samples =
+                g_layer_exec_profiled_all_chunk_idle_samples;
+            std::sort(sorted_samples.begin(), sorted_samples.end());
+            has_p75_all_chunk_idle_us_total = true;
+            has_p99_all_chunk_idle_us_total = true;
+            p75_all_chunk_idle_us_total =
+                get_sorted_quantile_us(sorted_samples, 0.75);
+            p99_all_chunk_idle_us_total =
+                get_sorted_quantile_us(sorted_samples, 0.99);
           }
         }
         std::vector<int64_t> chunk_idle_us_sum_total_list;
@@ -851,9 +924,23 @@ class LlmModelImplBase : public torch::nn::Module {
             << ", p50_batch_idle_ms_sum_chunks_total="
             << (has_p50_batch_idle_us_total ? p50_batch_idle_us_total / 1000.0
                                             : 0.0)
+            << ", p75_batch_idle_ms_sum_chunks_total="
+            << (has_p75_batch_idle_us_total ? p75_batch_idle_us_total / 1000.0
+                                            : 0.0)
+            << ", p99_batch_idle_ms_sum_chunks_total="
+            << (has_p99_batch_idle_us_total ? p99_batch_idle_us_total / 1000.0
+                                            : 0.0)
             << ", p50_all_chunks_idle_ms_total="
             << (has_p50_all_chunk_idle_us_total
                     ? p50_all_chunk_idle_us_total / 1000.0
+                    : 0.0)
+            << ", p75_all_chunks_idle_ms_total="
+            << (has_p75_all_chunk_idle_us_total
+                    ? p75_all_chunk_idle_us_total / 1000.0
+                    : 0.0)
+            << ", p99_all_chunks_idle_ms_total="
+            << (has_p99_all_chunk_idle_us_total
+                    ? p99_all_chunk_idle_us_total / 1000.0
                     : 0.0)
             << ", max_all_chunks_idle_ms_total="
             << static_cast<double>(max_all_chunk_idle_us_total) / 1000.0
