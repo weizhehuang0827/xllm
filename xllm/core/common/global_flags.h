@@ -192,6 +192,20 @@ DECLARE_bool(enable_layer_exec_profile);
 
 DECLARE_int32(layer_exec_profile_log_interval);
 
+DECLARE_bool(enable_h2d_layerwise_copy_profile);
+
+DECLARE_bool(h2d_layerwise_copy_profile_enable_layer_exec_profile);
+
+DECLARE_int32(h2d_layerwise_copy_profile_batch_size);
+
+DECLARE_int32(h2d_layerwise_copy_profile_context_len);
+
+DECLARE_int32(h2d_layerwise_copy_profile_h2d_blocks);
+
+DECLARE_int32(h2d_layerwise_copy_profile_steps);
+
+DECLARE_int32(h2d_layerwise_copy_profile_warmup_steps);
+
 DECLARE_string(priority_strategy);
 
 DECLARE_bool(use_mix_scheduler);
@@ -240,6 +254,10 @@ DECLARE_int32(profile_max_prompt_length);
 DECLARE_int32(request_queue_size);
 
 DECLARE_bool(enable_profile_kv_blocks);
+
+DECLARE_bool(enable_kv_cache_utilization_profile);
+
+DECLARE_int32(kv_cache_utilization_profile_log_interval);
 
 DECLARE_bool(disable_ttft_profiling);
 

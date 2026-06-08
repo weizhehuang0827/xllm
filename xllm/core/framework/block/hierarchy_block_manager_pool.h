@@ -84,6 +84,13 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   bool update_prefetch_result(std::shared_ptr<Request>& request,
                               const uint32_t timeout) override;
 
+  // Profile-only helpers for constructing a sequence whose KV blocks already
+  // live in host memory while device KV slots are allocated but uncached.
+  bool allocate_device_blocks_for_profile(Sequence* sequence,
+                                          size_t num_tokens);
+  bool allocate_host_blocks_for_profile(Sequence* sequence, size_t num_tokens);
+  void deallocate_host_and_device_without_cache_for_profile(Sequence* sequence);
+
   void get_merged_kvcache_event(KvCacheEvent* event) const override;
 
  private:

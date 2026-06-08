@@ -131,8 +131,11 @@ class ProfileManager {
           time_profiling_data,
       bool is_prefill);
 
-  std::shared_ptr<Request> generate_single_request(int32_t token_length,
-                                                   int32_t prefix_length);
+  std::shared_ptr<Request> generate_single_request(
+      int32_t token_length,
+      int32_t prefix_length,
+      int32_t seq_capacity = -1,
+      bool allocate_kv_blocks = true);
 
   std::string generate_filename(const std::string& file_suffix);
 
@@ -141,6 +144,17 @@ class ProfileManager {
   void eval_batch_latency_prediction(const std::string mode);
 
   void profile_token_budget();
+
+  void profile_h2d_layerwise_copy();
+
+  double run_h2d_layerwise_copy_profile_batch(
+      const std::string& mode_name,
+      uint32_t layers_wise_copy_batchs,
+      bool use_h2d,
+      bool recompute,
+      int32_t tail_recompute_blocks_per_request,
+      int32_t step,
+      bool warmup);
 
   // Warmup ACL graph executor with prefill and decode requests
   void warmup_for_graph();

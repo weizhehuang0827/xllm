@@ -272,6 +272,15 @@ DEFINE_bool(enable_profile_kv_blocks,
             true,
             "true if generate kv cache for profile");
 
+DEFINE_bool(enable_kv_cache_utilization_profile,
+            false,
+            "Whether to log KV cache utilization summary by scheduler batch.");
+
+DEFINE_int32(kv_cache_utilization_profile_log_interval,
+             100,
+             "When KV cache utilization profiling is enabled, print one "
+             "summary every N non-empty scheduler batches.");
+
 DEFINE_bool(disable_ttft_profiling,
             false,
             "Whether to disable TTFT profiling.");
@@ -461,6 +470,41 @@ DEFINE_int32(layer_exec_profile_log_interval,
              200,
              "When layer execution profiling is enabled, print one summary "
              "every N batches.");
+
+DEFINE_bool(enable_h2d_layerwise_copy_profile,
+            false,
+            "Whether to run synthetic H2D layer-wise copy profile in "
+            "ProfileManager startup.");
+
+DEFINE_bool(h2d_layerwise_copy_profile_enable_layer_exec_profile,
+            true,
+            "Whether synthetic H2D layer-wise copy profile should enable layer "
+            "execution profiling. Disable it to avoid layer profile events and "
+            "event synchronization overhead.");
+
+DEFINE_int32(h2d_layerwise_copy_profile_batch_size,
+             8,
+             "Synthetic decode batch size for H2D layer-wise copy profile.");
+
+DEFINE_int32(h2d_layerwise_copy_profile_context_len,
+             2048,
+             "Synthetic decode context length for H2D layer-wise copy "
+             "profile.");
+
+DEFINE_int32(h2d_layerwise_copy_profile_h2d_blocks,
+             32,
+             "Number of KV blocks copied from host to device per synthetic "
+             "H2D layer-wise copy profile batch.");
+
+DEFINE_int32(h2d_layerwise_copy_profile_steps,
+             3,
+             "Number of measured synthetic batches per H2D layer-wise copy "
+             "profile mode.");
+
+DEFINE_int32(h2d_layerwise_copy_profile_warmup_steps,
+             1,
+             "Number of warmup synthetic batches per H2D layer-wise copy "
+             "profile mode.");
 
 DEFINE_double(host_blocks_factor,
               0.0,

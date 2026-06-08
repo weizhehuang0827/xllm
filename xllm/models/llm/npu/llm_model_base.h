@@ -23,6 +23,7 @@ limitations under the License.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -59,10 +60,12 @@ namespace {
 std::atomic<int64_t> g_layer_exec_profiled_batches{0};
 std::atomic<int64_t> g_layer_exec_profiled_exec_us{0};
 std::atomic<int64_t> g_layer_exec_profiled_interval_us{0};
+std::atomic<int64_t> g_layer_exec_profiled_forward_us{0};
 std::atomic<int64_t> g_layer_exec_profiled_chunk_exec_us{0};
 std::atomic<int64_t> g_layer_exec_profiled_chunk_idle_us{0};
 std::atomic<int64_t> g_layer_exec_profiled_chunk_count{0};
 std::atomic<int64_t> g_layer_exec_profiled_chunk_nonzero_count{0};
+std::atomic<int64_t> g_layer_exec_profiled_forward_us_max{0};
 std::atomic<int64_t> g_layer_exec_profiled_chunk_idle_us_max{0};
 std::atomic<int64_t> g_layer_exec_profiled_all_chunk_idle_us_max{0};
 std::mutex g_layer_exec_profiled_chunk_totals_mutex;
@@ -80,6 +83,8 @@ std::priority_queue<int64_t, std::vector<int64_t>, std::greater<int64_t>>
     g_layer_exec_profiled_batch_idle_upper;
 std::mutex g_layer_exec_profiled_batch_idle_samples_mutex;
 std::vector<int64_t> g_layer_exec_profiled_batch_idle_samples;
+std::mutex g_layer_exec_profiled_batch_forward_samples_mutex;
+std::vector<int64_t> g_layer_exec_profiled_batch_forward_samples;
 std::mutex g_layer_exec_profiled_all_chunk_idle_median_mutex;
 std::priority_queue<int64_t> g_layer_exec_profiled_all_chunk_idle_lower;
 std::priority_queue<int64_t, std::vector<int64_t>, std::greater<int64_t>>
@@ -292,6 +297,7 @@ class LlmModelImplBase : public torch::nn::Module {
     std::vector<int64_t> chunk_idle_us_list;
     int64_t batch_exec_us = 0;
     int64_t batch_interval_us = 0;
+    int64_t batch_forward_us = 0;
     int64_t batch_chunk_exec_us = 0;
     int64_t batch_chunk_idle_us = 0;
     int64_t batch_chunk_count = 0;
@@ -519,7 +525,27 @@ class LlmModelImplBase : public torch::nn::Module {
                   << "ret=" << exec_elapsed_ret << ", chunk_idx=" << chunk_idx
                   << ", event_stream=" << static_cast<void*>(compute_stream);
             }
-            if (chunk_idx > 0) {
+            if (chunk_idx == 0) {
+              float idle_ms = 0.0f;
+              const auto idle_elapsed_ret = aclrtEventElapsedTime(
+                  &idle_ms, batch_anchor_event, chunk_start_events[chunk_idx]);
+              if (idle_elapsed_ret == ACL_SUCCESS) {
+                const int64_t idle_us = static_cast<int64_t>(idle_ms * 1000.0f);
+                chunk_idle_us_list[chunk_idx] = idle_us;
+                batch_chunk_idle_us += idle_us;
+                if (idle_us > max_chunk_idle_us) {
+                  max_chunk_idle_us = idle_us;
+                  max_chunk_idle_idx = static_cast<int64_t>(chunk_idx);
+                }
+              } else if (!chunk_profile_elapsed_error_logged) {
+                chunk_profile_elapsed_error_logged = true;
+                LOG(WARNING)
+                    << "[chunk_profile_debug] elapsed initial chunk idle "
+                    << "failed: ret=" << idle_elapsed_ret
+                    << ", chunk_idx=" << chunk_idx
+                    << ", event_stream=" << static_cast<void*>(compute_stream);
+              }
+            } else {
               float idle_ms = 0.0f;
               const auto idle_elapsed_ret =
                   aclrtEventElapsedTime(&idle_ms,
@@ -546,6 +572,11 @@ class LlmModelImplBase : public torch::nn::Module {
       }
       cleanup_chunk_events();
 #endif
+
+      batch_forward_us = batch_chunk_exec_us + batch_chunk_idle_us;
+      if (batch_forward_us <= 0) {
+        batch_forward_us = batch_exec_us + batch_interval_us;
+      }
 
       batch_chunk_count = static_cast<int64_t>(chunk_idle_us_list.size());
       for (const auto idle_us : chunk_idle_us_list) {
@@ -615,6 +646,10 @@ class LlmModelImplBase : public torch::nn::Module {
           g_layer_exec_profiled_interval_us.fetch_add(
               batch_interval_us, std::memory_order_relaxed) +
           batch_interval_us;
+      const int64_t total_forward_us =
+          g_layer_exec_profiled_forward_us.fetch_add(
+              batch_forward_us, std::memory_order_relaxed) +
+          batch_forward_us;
       const int64_t total_chunk_exec_us =
           g_layer_exec_profiled_chunk_exec_us.fetch_add(
               batch_chunk_exec_us, std::memory_order_relaxed) +
@@ -638,6 +673,15 @@ class LlmModelImplBase : public torch::nn::Module {
              !g_layer_exec_profiled_chunk_idle_us_max.compare_exchange_weak(
                  prev_max_chunk_idle_us,
                  batch_chunk_idle_us,
+                 std::memory_order_relaxed,
+                 std::memory_order_relaxed)) {
+      }
+      int64_t prev_max_forward_us =
+          g_layer_exec_profiled_forward_us_max.load(std::memory_order_relaxed);
+      while (prev_max_forward_us < batch_forward_us &&
+             !g_layer_exec_profiled_forward_us_max.compare_exchange_weak(
+                 prev_max_forward_us,
+                 batch_forward_us,
                  std::memory_order_relaxed,
                  std::memory_order_relaxed)) {
       }
@@ -669,6 +713,11 @@ class LlmModelImplBase : public torch::nn::Module {
         std::lock_guard<std::mutex> lock(
             g_layer_exec_profiled_batch_idle_samples_mutex);
         g_layer_exec_profiled_batch_idle_samples.push_back(batch_chunk_idle_us);
+      }
+      {
+        std::lock_guard<std::mutex> lock(
+            g_layer_exec_profiled_batch_forward_samples_mutex);
+        g_layer_exec_profiled_batch_forward_samples.push_back(batch_forward_us);
       }
       // Track exact running median (p50) of all chunk idle values across all
       // profiled steps.
@@ -711,10 +760,15 @@ class LlmModelImplBase : public torch::nn::Module {
       if (profiled_batches % log_interval == 0) {
         const int64_t avg_exec_us = total_exec_us / profiled_batches;
         const int64_t avg_interval_us = total_interval_us / profiled_batches;
+        const int64_t avg_forward_us = total_forward_us / profiled_batches;
         const int64_t avg_chunk_exec_us =
             total_chunk_exec_us / profiled_batches;
         const int64_t avg_chunk_idle_us =
             total_chunk_idle_us / profiled_batches;
+        const double forward_idle_ratio_total =
+            total_forward_us > 0 ? static_cast<double>(total_chunk_idle_us) /
+                                       static_cast<double>(total_forward_us)
+                                 : 0.0;
         const double chunk_idle_nonzero_ratio_total =
             total_chunk_count > 0
                 ? 100.0 * static_cast<double>(total_chunk_nonzero_count) /
@@ -731,6 +785,33 @@ class LlmModelImplBase : public torch::nn::Module {
         const int64_t max_all_chunk_idle_us_total =
             g_layer_exec_profiled_all_chunk_idle_us_max.load(
                 std::memory_order_relaxed);
+        const int64_t max_batch_forward_us_total =
+            g_layer_exec_profiled_forward_us_max.load(
+                std::memory_order_relaxed);
+        double p50_batch_forward_us_total = 0.0;
+        bool has_p50_batch_forward_us_total = false;
+        double p75_batch_forward_us_total = 0.0;
+        bool has_p75_batch_forward_us_total = false;
+        double p99_batch_forward_us_total = 0.0;
+        bool has_p99_batch_forward_us_total = false;
+        {
+          std::lock_guard<std::mutex> lock(
+              g_layer_exec_profiled_batch_forward_samples_mutex);
+          if (!g_layer_exec_profiled_batch_forward_samples.empty()) {
+            std::vector<int64_t> sorted_samples =
+                g_layer_exec_profiled_batch_forward_samples;
+            std::sort(sorted_samples.begin(), sorted_samples.end());
+            has_p50_batch_forward_us_total = true;
+            has_p75_batch_forward_us_total = true;
+            has_p99_batch_forward_us_total = true;
+            p50_batch_forward_us_total =
+                get_sorted_quantile_us(sorted_samples, 0.50);
+            p75_batch_forward_us_total =
+                get_sorted_quantile_us(sorted_samples, 0.75);
+            p99_batch_forward_us_total =
+                get_sorted_quantile_us(sorted_samples, 0.99);
+          }
+        }
         double p50_batch_idle_us_total = 0.0;
         bool has_p50_batch_idle_us_total = false;
         double p75_batch_idle_us_total = 0.0;
@@ -892,9 +973,32 @@ class LlmModelImplBase : public torch::nn::Module {
             << ", batch_exec_ms=" << static_cast<double>(batch_exec_us) / 1000.0
             << ", batch_interval_ms="
             << static_cast<double>(batch_interval_us) / 1000.0
+            << ", batch_forward_ms="
+            << static_cast<double>(batch_forward_us) / 1000.0
             << ", avg_exec_ms=" << static_cast<double>(avg_exec_us) / 1000.0
             << ", avg_interval_ms="
             << static_cast<double>(avg_interval_us) / 1000.0
+            << ", avg_forward_ms="
+            << static_cast<double>(avg_forward_us) / 1000.0
+            << ", sum_batch_forward_ms_total="
+            << static_cast<double>(total_forward_us) / 1000.0
+            << ", avg_batch_forward_ms_total="
+            << static_cast<double>(avg_forward_us) / 1000.0
+            << ", max_batch_forward_ms_total="
+            << static_cast<double>(max_batch_forward_us_total) / 1000.0
+            << ", p50_batch_forward_ms_total="
+            << (has_p50_batch_forward_us_total
+                    ? p50_batch_forward_us_total / 1000.0
+                    : 0.0)
+            << ", p75_batch_forward_ms_total="
+            << (has_p75_batch_forward_us_total
+                    ? p75_batch_forward_us_total / 1000.0
+                    : 0.0)
+            << ", p99_batch_forward_ms_total="
+            << (has_p99_batch_forward_us_total
+                    ? p99_batch_forward_us_total / 1000.0
+                    : 0.0)
+            << ", forward_idle_ratio_total=" << forward_idle_ratio_total
             << ", max_layer_exec_ms(layer=" << max_layer_exec_idx
             << ")=" << static_cast<double>(max_layer_exec_us) / 1000.0
             << ", max_layer_interval_ms(before_layer=" << max_layer_interval_idx
@@ -905,9 +1009,15 @@ class LlmModelImplBase : public torch::nn::Module {
             << static_cast<double>(batch_chunk_exec_us) / 1000.0
             << ", batch_chunk_idle_ms="
             << static_cast<double>(batch_chunk_idle_us) / 1000.0
+            << ", batch_idle_ms="
+            << static_cast<double>(batch_chunk_idle_us) / 1000.0
             << ", avg_chunk_exec_ms="
             << static_cast<double>(avg_chunk_exec_us) / 1000.0
             << ", avg_chunk_idle_ms="
+            << static_cast<double>(avg_chunk_idle_us) / 1000.0
+            << ", sum_batch_idle_ms_total="
+            << static_cast<double>(total_chunk_idle_us) / 1000.0
+            << ", avg_batch_idle_ms_total="
             << static_cast<double>(avg_chunk_idle_us) / 1000.0
             << ", sum_chunk_idle_ms_total="
             << static_cast<double>(total_chunk_idle_us) / 1000.0

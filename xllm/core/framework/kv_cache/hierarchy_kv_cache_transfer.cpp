@@ -18,11 +18,13 @@ limitations under the License.
 #include <folly/futures/Future.h>
 #include <sys/mman.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <memory>
 
+#include "common/global_flags.h"
 #include "kv_cache_store.h"
 namespace xllm {
 
@@ -294,16 +296,23 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
   const int64_t h2d_copy_blocks =
       static_cast<int64_t>(block_transfer_info.size());
   const int64_t num_layers = options_.layers();
+  int64_t batch_copy_elapsed_us = 0;
+  const bool full_wait = options_.layers_wise_copy_batchs() <= 1;
+  const uint32_t target_copy_batches =
+      std::max<uint32_t>(1, options_.layers_wise_copy_batchs());
   uint32_t layers_per_bacth_copy =
-      num_layers / options_.layers_wise_copy_batchs();
+      std::max<uint32_t>(1, num_layers / target_copy_batches);
   uint32_t num_batches = block_transfer_info.size() * cache_tensor_cnt_;
-  while (num_batches * layers_per_bacth_copy > BATCH_COPY_MAX_SIZE) {
+  while (layers_per_bacth_copy > 1 &&
+         num_batches * layers_per_bacth_copy > BATCH_COPY_MAX_SIZE) {
     layers_per_bacth_copy--;
   }
 
   uint32_t copy_cnt =
       (num_layers + layers_per_bacth_copy - 1) / layers_per_bacth_copy;
-  auto synchronizer = std::make_shared<NPULayerSynchronizerImpl>(copy_cnt);
+  const uint32_t synchronizer_event_cnt = full_wait ? 1 : copy_cnt;
+  auto synchronizer =
+      std::make_shared<NPULayerSynchronizerImpl>(synchronizer_event_cnt);
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -381,11 +390,14 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
                            1,
                            &fail_index);
 
+    const bool should_signal_layer =
+        !full_wait || static_cast<uint32_t>(index + 1) == copy_cnt;
     if (ret != 0 || fail_index != SIZE_MAX) {
       LOG(ERROR) << "aclrtMemcpyBatch error: " << ret
                  << ", fail_index:" << fail_index;
-    } else {
-      auto* event = synchronizer->get_event(index);
+    } else if (should_signal_layer) {
+      const int64_t event_index = full_wait ? 0 : index;
+      auto* event = synchronizer->get_event(event_index);
       ret = aclrtRecordEvent(*event, stream->get_stream()->stream());
       if (ret != 0) {
         LOG(ERROR) << "aclrtRecordEvent error: " << ret;
@@ -397,13 +409,31 @@ bool HierarchyKVCacheTransfer::h2d_batch_copy(
         std::chrono::duration_cast<std::chrono::microseconds>(layer_copy_end -
                                                               layer_copy_begin)
             .count();
+    batch_copy_elapsed_us += layer_copy_elapsed_us;
+    const int64_t event_index = full_wait ? 0 : index;
+    const int64_t profile_copy_blocks =
+        (!full_wait || should_signal_layer) ? h2d_copy_blocks : 0;
     synchronizer->add_h2d_copy_time_us(
-        index, layer_copy_elapsed_us, h2d_copy_blocks);
-    synchronizer->set_layer_range(index, start_layer_id, layer_id);
+        event_index, layer_copy_elapsed_us, profile_copy_blocks);
+    synchronizer->set_layer_range(event_index,
+                                  full_wait ? 0 : start_layer_id,
+                                  full_wait ? num_layers : layer_id);
 
-    auto* event_flag = synchronizer->get_event_flag(index);
-    event_flag->store(true, std::memory_order_release);
+    if (should_signal_layer) {
+      auto* event_flag = synchronizer->get_event_flag(event_index);
+      event_flag->store(true, std::memory_order_release);
+    }
     if (ret != 0) break;
+  }
+
+  if (FLAGS_enable_h2d_layerwise_copy_profile) {
+    LOG(INFO) << "[h2d_layerwise_copy_profile][h2d_copy] batch_id=" << batch_id
+              << ", h2d_copy_ms="
+              << static_cast<double>(batch_copy_elapsed_us) / 1000.0
+              << ", h2d_copy_blocks=" << h2d_copy_blocks
+              << ", layers_wise_copy_batchs="
+              << options_.layers_wise_copy_batchs()
+              << ", copy_chunks=" << copy_cnt;
   }
 
   if (stream->synchronize() != 0) {

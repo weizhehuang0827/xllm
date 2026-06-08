@@ -27,10 +27,12 @@ limitations under the License.
 #include <iomanip>
 #include <random>
 #include <sstream>
+#include <thread>
 
 #include "common/global_flags.h"
 #include "common/rec_model_utils.h"
 #include "framework/batch/batch_factory.h"
+#include "framework/block/hierarchy_block_manager_pool.h"
 #include "framework/request/request_state.h"
 
 namespace xllm {
@@ -56,6 +58,10 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
   if (options.enable_profile_token_budget()) {
     LOG(INFO) << "Starting profiliing token budget.";
     profile_token_budget();
+  }
+  if (FLAGS_enable_h2d_layerwise_copy_profile) {
+    LOG(INFO) << "Starting synthetic H2D layer-wise copy profile.";
+    profile_h2d_layerwise_copy();
   }
   // more profile here, such as token_budget profile and decode length
   // prediction.
@@ -523,7 +529,7 @@ ProfileManager::get_copy_block_profile() {
       // offline copy block profile
       // {"Qwen2-7B", 128, -1, 0.48, 0.24, "Qwen2-7B, block_size=128"},
       // {"Qwen2-7B", 128, -1, 0.36, 0.74, "Qwen2-7B, block_size=128"},
-      {"Qwen2-7B", 128, -1, 0.48, 0.74, "Qwen2-7B, block_size=128"},
+      {"Qwen2-7B", 128, -1, 0.8, 0.74, "Qwen2-7B, block_size=128"},
       {"Qwen2-7B", 64, -1, 0.20, 0.25, "Qwen2-7B, block_size=64"},
       {"Qwen3-32B", 128, 2, 0.972, 0.14, "Qwen3-32B, block_size=128, tp=2"},
       {"Qwen3-32B", 128, 4, 0.588, 0.14, "Qwen3-32B, block_size=128, tp=4"},
@@ -597,7 +603,9 @@ double ProfileManager::predict_copy_blocks_time(
 
 std::shared_ptr<Request> ProfileManager::generate_single_request(
     int32_t token_length,
-    int32_t prefix_length) {
+    int32_t prefix_length,
+    int32_t seq_capacity,
+    bool allocate_kv_blocks) {
   auto& model_args = engine_->model_args();
   int32_t vocab_size = model_args.vocab_size();
   int32_t eos_token_id = model_args.eos_token_id();
@@ -616,12 +624,19 @@ std::shared_ptr<Request> ProfileManager::generate_single_request(
   });
 
   RequestState req_state(token_ids);
+  if (seq_capacity > 0) {
+    req_state.seq_capacity = seq_capacity;
+  }
   req_state.enable_schedule_overlap = options_.enable_schedule_overlap();
   auto request = std::make_shared<Request>(
       /*request_id=*/"",
       /*x_request_id=*/"",
       /*x_request_time=*/"",
       req_state);
+
+  if (!allocate_kv_blocks) {
+    return request;
+  }
 
   // TODO: better disable prefix cache
   if (prefix_length > 0) {
@@ -640,6 +655,351 @@ std::shared_ptr<Request> ProfileManager::generate_single_request(
   }
 
   return request;
+}
+
+void ProfileManager::profile_h2d_layerwise_copy() {
+  const auto& block_options = block_manager_pool_->options();
+  if (block_options.host_num_blocks() <= block_options.num_blocks()) {
+    LOG(WARNING) << "Skip synthetic H2D layer-wise copy profile because host "
+                    "KV cache is not enabled. Set host_blocks_factor > 1.";
+    return;
+  }
+  CHECK(dynamic_cast<HierarchyBlockManagerPool*>(block_manager_pool_) !=
+        nullptr)
+      << "Synthetic H2D profile requires HierarchyBlockManagerPool.";
+
+  const bool old_enable_layer_exec_profile = FLAGS_enable_layer_exec_profile;
+  const int32_t old_layer_exec_profile_log_interval =
+      FLAGS_layer_exec_profile_log_interval;
+  const bool old_enable_h2d_overlap_profile = FLAGS_enable_h2d_overlap_profile;
+  const int32_t old_h2d_overlap_profile_log_interval =
+      FLAGS_h2d_overlap_profile_log_interval;
+  FLAGS_enable_layer_exec_profile =
+      FLAGS_h2d_layerwise_copy_profile_enable_layer_exec_profile;
+  if (FLAGS_enable_layer_exec_profile) {
+    FLAGS_layer_exec_profile_log_interval = 1;
+  }
+  FLAGS_enable_h2d_overlap_profile = true;
+  FLAGS_h2d_overlap_profile_log_interval = 1;
+
+  struct H2DLayerwiseCopyProfileCase {
+    std::string mode_name;
+    uint32_t layers_wise_copy_batchs;
+    bool use_h2d;
+    bool recompute;
+    int32_t tail_recompute_blocks_per_request;
+  };
+  const uint32_t configured_layers_wise_copy_batchs =
+      std::max<uint32_t>(1, FLAGS_layers_wise_copy_batchs);
+  std::vector<H2DLayerwiseCopyProfileCase> profile_cases;
+  if (configured_layers_wise_copy_batchs == 1) {
+    profile_cases.push_back({"device_cached", 0, false, false, 0});
+    profile_cases.push_back({"recompute", 0, false, true, 0});
+    profile_cases.push_back({"full_wait", 1, true, false, 0});
+    profile_cases.push_back({"full_wait_minus1", 1, true, false, 1});
+  } else {
+    profile_cases.push_back(
+        {"layer_wise", configured_layers_wise_copy_batchs, true, false, 0});
+    profile_cases.push_back({"layer_wise_minus1",
+                             configured_layers_wise_copy_batchs,
+                             true,
+                             false,
+                             1});
+  }
+  const int32_t warmup_steps =
+      std::max(0, FLAGS_h2d_layerwise_copy_profile_warmup_steps);
+  const int32_t profile_steps =
+      std::max(1, FLAGS_h2d_layerwise_copy_profile_steps);
+
+  for (const auto& profile_case : profile_cases) {
+    LOG(INFO) << "[h2d_layerwise_copy_profile] mode_begin="
+              << profile_case.mode_name << ", layers_wise_copy_batchs="
+              << profile_case.layers_wise_copy_batchs
+              << ", server_layers_wise_copy_batchs="
+              << configured_layers_wise_copy_batchs
+              << ", warmup_steps=" << warmup_steps
+              << ", profile_steps=" << profile_steps
+              << ", enable_control_h2d_block_num="
+              << FLAGS_enable_control_h2d_block_num
+              << ", enable_layer_exec_profile="
+              << FLAGS_enable_layer_exec_profile;
+
+    for (int32_t step = 0; step < warmup_steps; ++step) {
+      run_h2d_layerwise_copy_profile_batch(
+          profile_case.mode_name,
+          profile_case.layers_wise_copy_batchs,
+          profile_case.use_h2d,
+          profile_case.recompute,
+          profile_case.tail_recompute_blocks_per_request,
+          step,
+          true);
+    }
+
+    double total_wall_batch_latency_ms = 0.0;
+    for (int32_t step = 0; step < profile_steps; ++step) {
+      total_wall_batch_latency_ms += run_h2d_layerwise_copy_profile_batch(
+          profile_case.mode_name,
+          profile_case.layers_wise_copy_batchs,
+          profile_case.use_h2d,
+          profile_case.recompute,
+          profile_case.tail_recompute_blocks_per_request,
+          step,
+          false);
+    }
+
+    LOG(INFO) << "[h2d_layerwise_copy_profile] mode_summary="
+              << profile_case.mode_name << ", layers_wise_copy_batchs="
+              << profile_case.layers_wise_copy_batchs
+              << ", measured_batches=" << profile_steps
+              << ", avg_wall_batch_latency_ms="
+              << total_wall_batch_latency_ms / profile_steps;
+  }
+
+  FLAGS_enable_layer_exec_profile = old_enable_layer_exec_profile;
+  FLAGS_layer_exec_profile_log_interval = old_layer_exec_profile_log_interval;
+  FLAGS_enable_h2d_overlap_profile = old_enable_h2d_overlap_profile;
+  FLAGS_h2d_overlap_profile_log_interval = old_h2d_overlap_profile_log_interval;
+}
+
+double ProfileManager::run_h2d_layerwise_copy_profile_batch(
+    const std::string& mode_name,
+    uint32_t layers_wise_copy_batchs,
+    bool use_h2d,
+    bool recompute,
+    int32_t tail_recompute_blocks_per_request,
+    int32_t step,
+    bool warmup) {
+  const auto& model_args = engine_->model_args();
+  const auto& block_options = block_manager_pool_->options();
+  auto* hierarchy_block_manager_pool =
+      dynamic_cast<HierarchyBlockManagerPool*>(block_manager_pool_);
+  CHECK(hierarchy_block_manager_pool != nullptr)
+      << "Synthetic H2D profile requires HierarchyBlockManagerPool.";
+  CHECK_GT(block_options.block_size(), 0)
+      << "Synthetic H2D profile requires positive block_size.";
+  const int32_t requested_batch_size =
+      std::max(1, FLAGS_h2d_layerwise_copy_profile_batch_size);
+
+  int32_t requested_context_len =
+      std::max(1, FLAGS_h2d_layerwise_copy_profile_context_len);
+  if (model_args.max_position_embeddings() > 1) {
+    requested_context_len = std::min<int32_t>(
+        requested_context_len, model_args.max_position_embeddings() - 1);
+  }
+
+  const int32_t requested_h2d_blocks =
+      std::max(1, FLAGS_h2d_layerwise_copy_profile_h2d_blocks);
+  const size_t requested_context_blocks =
+      (static_cast<size_t>(requested_context_len) + block_options.block_size() -
+       1) /
+      block_options.block_size();
+  const bool requested_context_fits =
+      requested_context_blocks <= static_cast<size_t>(requested_h2d_blocks);
+  const size_t context_blocks = requested_context_fits
+                                    ? requested_context_blocks
+                                    : static_cast<size_t>(requested_h2d_blocks);
+  const int32_t batch_size =
+      requested_context_fits
+          ? std::min<int32_t>(
+                requested_batch_size,
+                static_cast<int32_t>(requested_h2d_blocks / context_blocks))
+          : 1;
+  const int32_t context_len = static_cast<int32_t>(std::min<size_t>(
+      requested_context_len,
+      context_blocks * static_cast<size_t>(block_options.block_size())));
+  const size_t tail_recompute_blocks =
+      use_h2d ? std::min<size_t>(static_cast<size_t>(std::max(
+                                     0, tail_recompute_blocks_per_request)),
+                                 context_blocks)
+              : 0;
+  const size_t h2d_blocks_per_request =
+      use_h2d ? context_blocks - tail_recompute_blocks : 0;
+  const int32_t h2d_tokens_per_request = static_cast<int32_t>(
+      std::min<size_t>(static_cast<size_t>(context_len),
+                       h2d_blocks_per_request *
+                           static_cast<size_t>(block_options.block_size())));
+  const int32_t tail_recompute_tokens_per_request =
+      use_h2d ? context_len - h2d_tokens_per_request : 0;
+  const int32_t expected_h2d_blocks =
+      use_h2d ? static_cast<int32_t>(h2d_blocks_per_request * batch_size) : 0;
+  const size_t tokens_budget =
+      recompute ? static_cast<size_t>(context_len)
+                : (use_h2d ? static_cast<size_t>(std::max(
+                                 1, tail_recompute_tokens_per_request + 1))
+                           : 1);
+  CHECK_GT(batch_size, 0);
+  CHECK_GT(context_len, 0);
+  CHECK_GT(context_blocks, 0);
+
+  std::vector<Sequence*> sequences;
+  std::vector<size_t> sequences_budget;
+  std::vector<std::shared_ptr<Request>> requests;
+  sequences.reserve(batch_size);
+  sequences_budget.reserve(batch_size);
+  requests.reserve(batch_size);
+
+  const int32_t eos_token_id = model_args.eos_token_id();
+  int32_t decode_token_id = 1;
+  if (decode_token_id == eos_token_id && model_args.vocab_size() > 2) {
+    decode_token_id = 2;
+  }
+
+  for (int32_t i = 0; i < batch_size; ++i) {
+    auto request = generate_single_request(
+        context_len, 0, context_len + 8, /*allocate_kv_blocks=*/false);
+    auto* sequence = request->sequences()[0].get();
+    CHECK_EQ(sequence->kv_state().num_kv_blocks(), 0);
+    CHECK_EQ(sequence->kv_state().kv_cache_tokens_num(), 0);
+    const int32_t device_token_capacity =
+        recompute ? context_len : context_len + 1;
+    if (!hierarchy_block_manager_pool->allocate_device_blocks_for_profile(
+            sequence, device_token_capacity)) {
+      LOG(FATAL) << "Synthetic H2D profile failed to allocate device KV "
+                    "slots, context_len="
+                 << context_len;
+    }
+    CHECK_EQ(sequence->kv_state().kv_cache_tokens_num(), 0);
+    if (use_h2d) {
+      if (!hierarchy_block_manager_pool->allocate_host_blocks_for_profile(
+              sequence, context_len)) {
+        LOG(FATAL) << "Synthetic H2D profile failed to allocate host KV "
+                      "blocks, context_len="
+                   << context_len;
+      }
+      CHECK_EQ(sequence->kv_state().kv_cache_tokens_num(), 0);
+      CHECK_EQ(sequence->host_kv_state().kv_cache_tokens_num(),
+               static_cast<size_t>(context_len));
+    } else {
+      CHECK_EQ(sequence->host_kv_state().kv_cache_tokens_num(), 0);
+    }
+
+    requests.emplace_back(request);
+    sequences.emplace_back(sequence);
+    sequences_budget.emplace_back(tokens_budget);
+  }
+
+  std::vector<std::vector<BlockTransferInfo>> h2d_infos_by_dp(
+      options_.dp_size());
+  int32_t total_h2d_blocks = 0;
+
+  if (use_h2d) {
+    for (size_t block_idx = 0; block_idx < h2d_blocks_per_request;
+         ++block_idx) {
+      for (auto* sequence : sequences) {
+        const int32_t dp_rank = sequence->dp_rank();
+        CHECK_GE(dp_rank, 0);
+        CHECK_LT(dp_rank, options_.dp_size());
+        const auto hbm_blocks = sequence->kv_state().kv_blocks();
+        const auto host_blocks = sequence->host_kv_state().kv_blocks();
+        CHECK_LT(block_idx, hbm_blocks.size());
+        CHECK_LT(block_idx, host_blocks.size());
+        const int32_t src_block_id = host_blocks[block_idx].id();
+        const int32_t dst_block_id = hbm_blocks[block_idx].id();
+        h2d_infos_by_dp[dp_rank].emplace_back(
+            src_block_id,
+            dst_block_id,
+            host_blocks[block_idx].get_immutable_hash_value(),
+            TransferType::H2D);
+        ++total_h2d_blocks;
+      }
+    }
+  }
+  CHECK_EQ(total_h2d_blocks, expected_h2d_blocks);
+
+  if (!recompute) {
+    for (auto* sequence : sequences) {
+      sequence->kv_state().set_kv_cache_tokens_num(context_len);
+      sequence->append_token(decode_token_id);
+      if (use_h2d) {
+        sequence->kv_state().set_kv_cache_tokens_num(h2d_tokens_per_request);
+      }
+    }
+  }
+
+  auto batches =
+      BatchFactory::get_instance(options_.dp_size())
+          ->create_batches(requests, sequences, sequences_budget, nullptr);
+
+  if (use_h2d) {
+    for (int32_t dp_rank = 0; dp_rank < options_.dp_size(); ++dp_rank) {
+      if (h2d_infos_by_dp[dp_rank].empty()) {
+        continue;
+      }
+      CHECK(!batches[dp_rank].empty())
+          << "Synthetic H2D profile generated H2D infos for an empty DP batch.";
+      batches[dp_rank].set_batch_id();
+    }
+  }
+  const uint64_t profile_batch_id =
+      batches.empty() ? 0 : batches.front().batch_id();
+
+  const int32_t device_kv_tokens_before_h2d =
+      use_h2d ? 0 : ((!recompute) ? context_len : 0);
+  const int32_t host_kv_tokens = use_h2d ? context_len : 0;
+  const int32_t device_kv_tokens_for_forward =
+      recompute ? 0 : (use_h2d ? h2d_tokens_per_request : context_len);
+
+  LOG(INFO) << "[h2d_layerwise_copy_profile] mode=" << mode_name
+            << ", layers_wise_copy_batchs=" << layers_wise_copy_batchs
+            << ", step=" << step << ", warmup=" << warmup
+            << ", batch_id=" << profile_batch_id
+            << ", requested_batch_size=" << requested_batch_size
+            << ", batch_size=" << batch_size
+            << ", requested_context_len=" << requested_context_len
+            << ", context_len=" << context_len
+            << ", requested_context_blocks=" << requested_context_blocks
+            << ", context_blocks=" << context_blocks
+            << ", requested_h2d_blocks=" << requested_h2d_blocks
+            << ", h2d_blocks=" << total_h2d_blocks
+            << ", h2d_blocks_per_request=" << h2d_blocks_per_request
+            << ", tail_recompute_blocks_per_request=" << tail_recompute_blocks
+            << ", h2d_tokens_per_request=" << h2d_tokens_per_request
+            << ", tail_recompute_tokens_per_request="
+            << tail_recompute_tokens_per_request
+            << ", tokens_budget_per_request=" << tokens_budget
+            << ", device_kv_tokens_before_h2d=" << device_kv_tokens_before_h2d
+            << ", host_kv_tokens=" << host_kv_tokens
+            << ", device_kv_tokens_for_forward="
+            << device_kv_tokens_for_forward;
+
+  if (use_h2d) {
+    for (int32_t dp_rank = 0; dp_rank < options_.dp_size(); ++dp_rank) {
+      if (h2d_infos_by_dp[dp_rank].empty()) {
+        continue;
+      }
+      engine_->transfer_kv_blocks(
+          dp_rank, batches[dp_rank].batch_id(), h2d_infos_by_dp[dp_rank]);
+    }
+
+    // Profile-only guard: transfer_kv_blocks schedules the H2D copy
+    // asynchronously, and the copy thread creates/registers the layer-wise
+    // synchronizer. Give it a short head start so forward does not enter before
+    // the synchronizer is visible.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  const absl::Time start_time = absl::Now();
+  engine_->step(batches);
+  if (options_.enable_schedule_overlap()) {
+    engine_->update_last_step_result(batches);
+  }
+  const double wall_batch_latency_ms =
+      absl::ToDoubleMilliseconds(absl::Now() - start_time);
+
+  LOG(INFO) << "[h2d_layerwise_copy_profile] mode=" << mode_name
+            << ", layers_wise_copy_batchs=" << layers_wise_copy_batchs
+            << ", step=" << step << ", warmup=" << warmup
+            << ", batch_id=" << profile_batch_id
+            << ", wall_batch_latency_ms=" << wall_batch_latency_ms
+            << ", h2d_blocks=" << total_h2d_blocks;
+
+  for (auto& request : requests) {
+    hierarchy_block_manager_pool
+        ->deallocate_host_and_device_without_cache_for_profile(
+            request->sequences()[0].get());
+  }
+
+  return wall_batch_latency_ms;
 }
 
 // collect the latency of each step

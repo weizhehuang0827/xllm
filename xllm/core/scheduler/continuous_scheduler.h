@@ -23,6 +23,7 @@ limitations under the License.
 #include <memory>
 #include <queue>
 #include <unordered_map>
+#include <vector>
 
 #include "async_response_processor.h"
 #include "common/macros.h"
@@ -310,6 +311,9 @@ class ContinuousScheduler : public Scheduler {
   bool is_first_step_ = true;
 
  private:
+  void record_kv_cache_utilization_profile(const std::vector<Batch>& batch);
+  void flush_kv_cache_utilization_profile(bool final);
+
   std::vector<Batch> schedule_request(const absl::Duration& timeout);
 
   virtual void update_token_latency_metrics(std::vector<Sequence*>& sequences);
@@ -327,6 +331,16 @@ class ContinuousScheduler : public Scheduler {
   void update_memory_metrics(std::vector<Sequence*>& sequences);
 
   void create_running_queue(const Options& options);
+
+  uint64_t kv_util_profile_phase_id_ = 0;
+  uint64_t kv_util_profile_total_batches_ = 0;
+  uint64_t kv_util_profile_window_batches_ = 0;
+  double kv_util_profile_total_sum_ = 0.0;
+  double kv_util_profile_window_sum_ = 0.0;
+  double kv_util_profile_total_max_ = 0.0;
+  double kv_util_profile_window_max_ = 0.0;
+  std::vector<double> kv_util_profile_total_samples_;
+  std::vector<double> kv_util_profile_window_samples_;
 };
 
 }  // namespace xllm

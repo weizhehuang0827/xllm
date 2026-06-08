@@ -20,6 +20,8 @@ limitations under the License.
 #include "block_manager_impl.h"
 #include "common/global_flags.h"
 #include "concurrent_block_manager_impl.h"
+#include "framework/prefix_cache/prefix_cache.h"
+#include "util/hash_util.h"
 
 namespace xllm {
 
@@ -285,6 +287,67 @@ void HierarchyBlockManagerPool::allocate_host_shared(Sequence* sequence) {
         host_block_managers_[dp_rank]->allocate_shared(sequence->tokens());
     sequence->add_shared_host_kv_blocks(std::move(shared_blocks));
   }
+}
+
+bool HierarchyBlockManagerPool::allocate_device_blocks_for_profile(
+    Sequence* sequence,
+    size_t num_tokens) {
+  DCHECK(sequence != nullptr);
+  CHECK_GT(options_.block_size(), 0);
+  int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
+  const size_t num_blocks_needed =
+      (num_tokens + options_.block_size() - 1) / options_.block_size();
+  if (num_blocks_needed == 0) {
+    return true;
+  }
+
+  auto blocks = block_managers_[dp_rank]->allocate(num_blocks_needed);
+  if (blocks.size() != num_blocks_needed) {
+    block_managers_[dp_rank]->deallocate({blocks});
+    return false;
+  }
+
+  sequence->add_kv_blocks(blocks);
+  return true;
+}
+
+bool HierarchyBlockManagerPool::allocate_host_blocks_for_profile(
+    Sequence* sequence,
+    size_t num_tokens) {
+  DCHECK(sequence != nullptr);
+  CHECK_GT(options_.block_size(), 0);
+  int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
+  const size_t num_blocks_needed =
+      (num_tokens + options_.block_size() - 1) / options_.block_size();
+  if (num_blocks_needed == 0) {
+    return true;
+  }
+
+  auto host_blocks = host_block_managers_[dp_rank]->allocate(num_blocks_needed);
+  if (host_blocks.size() != num_blocks_needed) {
+    host_block_managers_[dp_rank]->deallocate({host_blocks});
+    return false;
+  }
+
+  uint8_t zero_hash[XXH3_128BITS_HASH_VALUE_LEN] = {};
+  for (auto& block : host_blocks) {
+    block.set_hash_value(zero_hash);
+  }
+  PrefixCache::compute_hash_keys(
+      sequence->tokens(), host_blocks, /*cached_blocks=*/0);
+  sequence->add_host_kv_blocks(host_blocks);
+  sequence->host_kv_state().set_kv_cache_tokens_num(num_tokens);
+  return true;
+}
+
+void HierarchyBlockManagerPool::
+    deallocate_host_and_device_without_cache_for_profile(Sequence* sequence) {
+  DCHECK(sequence != nullptr);
+  int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
+  host_block_managers_[dp_rank]->deallocate(
+      sequence->host_kv_state().kv_blocks());
+  block_managers_[dp_rank]->deallocate(sequence->kv_state().kv_blocks());
+  sequence->reset();
 }
 
 void HierarchyBlockManagerPool::prefetch_from_storage(

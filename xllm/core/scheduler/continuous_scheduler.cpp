@@ -20,12 +20,14 @@ limitations under the License.
 #include <folly/MPMCQueue.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <memory>
 #include <sstream>
+#include <vector>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -69,6 +71,20 @@ size_t get_sequence_free_blocks_for_rank(KVCacheManager* kv_cache_manager,
     return free_blocks[dp_rank];
   }
   return util::max(free_blocks);
+}
+
+double get_sorted_quantile(const std::vector<double>& sorted_values, double q) {
+  if (sorted_values.empty()) {
+    return 0.0;
+  }
+  const double clamped_q = std::max(0.0, std::min(1.0, q));
+  const double pos = static_cast<double>(sorted_values.size() - 1) * clamped_q;
+  const size_t idx = static_cast<size_t>(pos);
+  const double frac = pos - static_cast<double>(idx);
+  if (idx + 1 < sorted_values.size()) {
+    return sorted_values[idx] * (1.0 - frac) + sorted_values[idx + 1] * frac;
+  }
+  return sorted_values[idx];
 }
 
 }  // namespace
@@ -134,7 +150,10 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
   }
 }
 
-ContinuousScheduler::~ContinuousScheduler() { running_requests_.clear(); }
+ContinuousScheduler::~ContinuousScheduler() {
+  flush_kv_cache_utilization_profile(true);
+  running_requests_.clear();
+}
 
 bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
@@ -1004,6 +1023,7 @@ std::vector<Batch> ContinuousScheduler::schedule_request(
           return one_batch.empty();
         });
     if (!all_empty) {
+      record_kv_cache_utilization_profile(batch);
       return batch;
     }
 
@@ -1021,8 +1041,108 @@ std::vector<Batch> ContinuousScheduler::schedule_request(
         std::min(absl::Milliseconds(kStepSleepTimeMs), deadline - now);
     absl::SleepFor(time_to_sleep);
   }
+  flush_kv_cache_utilization_profile(true);
   // return an empty batch
   return batch;
+}
+
+void ContinuousScheduler::record_kv_cache_utilization_profile(
+    const std::vector<Batch>& batch) {
+  if (!FLAGS_enable_kv_cache_utilization_profile) {
+    return;
+  }
+  const bool all_empty =
+      std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
+        return one_batch.empty();
+      });
+  if (all_empty) {
+    return;
+  }
+
+  if (kv_util_profile_total_batches_ == 0) {
+    ++kv_util_profile_phase_id_;
+    kv_util_profile_total_max_ = 0.0;
+    kv_util_profile_window_max_ = 0.0;
+    kv_util_profile_total_samples_.clear();
+    kv_util_profile_window_samples_.clear();
+  }
+
+  const double kv_util = kv_cache_manager_->kv_cache_utilization();
+  kv_util_profile_total_batches_ += 1;
+  kv_util_profile_window_batches_ += 1;
+  kv_util_profile_total_sum_ += kv_util;
+  kv_util_profile_window_sum_ += kv_util;
+  kv_util_profile_total_max_ = std::max(kv_util_profile_total_max_, kv_util);
+  kv_util_profile_window_max_ = std::max(kv_util_profile_window_max_, kv_util);
+  kv_util_profile_total_samples_.push_back(kv_util);
+  kv_util_profile_window_samples_.push_back(kv_util);
+
+  const int32_t interval =
+      std::max<int32_t>(1, FLAGS_kv_cache_utilization_profile_log_interval);
+  if (kv_util_profile_window_batches_ >= static_cast<uint64_t>(interval)) {
+    flush_kv_cache_utilization_profile(false);
+  }
+}
+
+void ContinuousScheduler::flush_kv_cache_utilization_profile(bool final) {
+  if (!FLAGS_enable_kv_cache_utilization_profile) {
+    return;
+  }
+  if (kv_util_profile_window_batches_ == 0 &&
+      (!final || kv_util_profile_total_batches_ == 0)) {
+    return;
+  }
+
+  const double window_avg =
+      kv_util_profile_window_batches_ == 0
+          ? 0.0
+          : kv_util_profile_window_sum_ / kv_util_profile_window_batches_;
+  const double total_avg =
+      kv_util_profile_total_sum_ / kv_util_profile_total_batches_;
+  std::vector<double> window_samples = kv_util_profile_window_samples_;
+  std::sort(window_samples.begin(), window_samples.end());
+  std::vector<double> total_samples = kv_util_profile_total_samples_;
+  std::sort(total_samples.begin(), total_samples.end());
+  const double window_p50 = get_sorted_quantile(window_samples, 0.50);
+  const double window_p75 = get_sorted_quantile(window_samples, 0.75);
+  const double total_p50 = get_sorted_quantile(total_samples, 0.50);
+  const double total_p75 = get_sorted_quantile(total_samples, 0.75);
+
+  LOG(INFO) << "[kv_cache_utilization_profile]"
+            << " phase=" << kv_util_profile_phase_id_
+            << " final=" << (final ? 1 : 0)
+            << " total_batches=" << kv_util_profile_total_batches_
+            << " window_batches=" << kv_util_profile_window_batches_
+            << " window_avg=" << window_avg << " window_p50=" << window_p50
+            << " window_p75=" << window_p75
+            << " window_max=" << kv_util_profile_window_max_
+            << " total_avg=" << total_avg << " total_p50=" << total_p50
+            << " total_p75=" << total_p75
+            << " total_max=" << kv_util_profile_total_max_
+            << " current=" << kv_cache_manager_->kv_cache_utilization()
+            << " num_running_requests=" << running_requests_.size()
+            << " num_running_sequences=" << running_sequences_.size()
+            << " num_pending_requests="
+            << pending_requests_.load(std::memory_order_relaxed)
+            << " num_waiting_requests="
+            << waiting_priority_queue_.size() +
+                   waiting_priority_queue_offline_.size()
+            << " num_running_queue_requests="
+            << (running_queue_ ? running_queue_->size() : 0)
+            << " num_running_queue_offline_requests="
+            << (running_queue_offline_ ? running_queue_offline_->size() : 0);
+
+  kv_util_profile_window_batches_ = 0;
+  kv_util_profile_window_sum_ = 0.0;
+  kv_util_profile_window_max_ = 0.0;
+  kv_util_profile_window_samples_.clear();
+
+  if (final) {
+    kv_util_profile_total_batches_ = 0;
+    kv_util_profile_total_sum_ = 0.0;
+    kv_util_profile_total_max_ = 0.0;
+    kv_util_profile_total_samples_.clear();
+  }
 }
 
 // step the scheduler forward by one step
