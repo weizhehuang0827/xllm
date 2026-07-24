@@ -267,6 +267,32 @@ def _collect_submodule_init_issues(repo_root: str) -> dict[str, str]:
         elif state == "U":
             issues[path] = "merge conflict"
 
+    # Additionally check nested submodules inside third_party/xllm_ops only.
+    # We avoid --recursive on the top-level because CI environments do not
+    # initialize all nested submodules (e.g. Mooncake, cpprestsdk).
+    xllm_ops_path = os.path.join(repo_root, "third_party", "xllm_ops")
+    if os.path.isdir(xllm_ops_path):
+        ok, nested_output = _run_git_command(xllm_ops_path, ["submodule", "status"])
+        if ok:
+            for line in nested_output.splitlines():
+                if not line:
+                    continue
+                nested_state = line[0]
+                nested_content = line[1:].strip()
+                nested_parts = nested_content.split()
+                if len(nested_parts) < 2:
+                    continue
+                nested_path = nested_parts[1]
+                nested_commit = nested_parts[0]
+                prefixed_path = f"third_party/xllm_ops/{nested_path}"
+
+                if nested_state == "-":
+                    issues[prefixed_path] = f"uninitialized (expected commit starts with {nested_commit})"
+                elif nested_state == "+":
+                    issues[prefixed_path] = f"commit mismatch (checked-out commit starts with {nested_commit})"
+                elif nested_state == "U":
+                    issues[prefixed_path] = "merge conflict"
+
     return issues
 
 def _is_dependency_installed(required_files: list[str]) -> bool:
