@@ -30,13 +30,13 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-bool is_mtp_algorithm(std::string algorithm) {
+bool is_supported_algorithm(std::string algorithm) {
   std::transform(
       algorithm.begin(),
       algorithm.end(),
       algorithm.begin(),
       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return algorithm == "mtp";
+  return algorithm == "mtp" || algorithm == "dflash" || algorithm == "dspark";
 }
 
 struct PruneCandidate {
@@ -51,7 +51,7 @@ AdaptiveSpeculativeController::AdaptiveSpeculativeController(
     const runtime::Options& options)
     : enabled_(options.enable_adaptive_speculative_decode() &&
                options.num_speculative_tokens() > 1 &&
-               is_mtp_algorithm(options.speculative_algorithm()) &&
+               is_supported_algorithm(options.speculative_algorithm()) &&
                !options.enable_graph()),
       min_gain_(options.adaptive_speculative_min_gain()) {}
 

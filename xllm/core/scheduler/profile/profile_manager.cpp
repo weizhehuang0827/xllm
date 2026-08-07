@@ -465,10 +465,12 @@ void ProfileManager::profile_speculative_validate_time() {
       speculative_algorithm.begin(),
       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   if (speculative_config.num_speculative_tokens() <= 1 ||
-      speculative_algorithm != "mtp") {
+      (speculative_algorithm != "mtp" && speculative_algorithm != "dflash" &&
+       speculative_algorithm != "dspark")) {
     return;
   }
-  LOG(INFO) << "Starting speculative validate profile for MTP, "
+  LOG(INFO) << "Starting speculative validate profile for "
+            << speculative_algorithm << ", "
             << "adaptive_enabled="
             << speculative_config.enable_adaptive_speculative_decode();
 
