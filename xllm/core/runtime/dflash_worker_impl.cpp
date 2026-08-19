@@ -1465,7 +1465,16 @@ std::vector<int32_t> DFlashWorkerImpl::compute_adaptive_prefix_lengths(
     const ForwardInput& input) {
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
   if (adaptive_spec_controller_ == nullptr ||
-      !adaptive_spec_controller_->enabled()) {
+      !adaptive_spec_controller_->enabled() ||
+      !SpeculativeProfileRegistry::get_instance()
+           .has_validate_time_predictor()) {
+    // Gate pruning on the validate-time predictor (align with MTP). The
+    // predictor is produced by speculative-validate profiling, so it is absent
+    // (a) during profiling itself — which drives real DECODE validate requests
+    // and MUST run the full, unpruned width to keep its (batch, query, prefix)
+    // samples consistent — and (b) whenever profiling is disabled, where
+    // pruning would otherwise fall back to a flat cost model and prune blindly.
+    // Both cases correctly fall back to static full-width validate.
     return {};
   }
   // Prefer the trained ConfidenceHead output when present (DSpark); otherwise

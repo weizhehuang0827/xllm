@@ -521,8 +521,12 @@ void ProfileManager::profile_speculative_validate_time() {
     return;
   }
 
-  const int32_t max_query_len =
-      std::min<int32_t>(speculative_config.num_speculative_tokens() + 1, 10);
+  // The per-seq validate width the controller ever asks for is at most
+  // num_speculative_tokens + 1 (anchor + all drafts). Sweep query_len up to
+  // that real ceiling so query_token_ms is fit over the full range the
+  // controller uses — capping it (e.g. at 10) forces the controller to
+  // extrapolate the slope for large SL and inflates the coefficient.
+  const int32_t max_query_len = speculative_config.num_speculative_tokens() + 1;
   const int32_t max_batch_size =
       std::min<int32_t>(options_.max_seqs_per_batch(), 256);
   std::vector<int32_t> query_lens;
@@ -570,16 +574,29 @@ void ProfileManager::profile_speculative_validate_time() {
   for (const int32_t prefix_len : prefix_lens) {
     for (const int32_t query_len : query_lens) {
       for (const int32_t batch_size : batch_sizes) {
-        const int32_t token_length = prefix_len + query_len;
-        const int32_t blocks_per_seq =
-            (prefix_len + block_size - 1) / block_size +
-            (token_length + block_size - 1) / block_size;
-        if (batch_size * blocks_per_seq > total_blocks * 9 / 10) {
+        // The validate step is measured as batch_size*query_len decode rows,
+        // each holding prefix_len+1 tokens (see below). Bound the block budget
+        // against that real allocation so profiling never FATALs on OOM.
+        const int32_t rows = batch_size * query_len;
+        const int32_t blocks_per_row =
+            (prefix_len + 1 + block_size - 1) / block_size;
+        if (rows * blocks_per_row > total_blocks * 9 / 10) {
           continue;
         }
+        // Measure the REAL validate kernel. The adaptive validate step flattens
+        // each sequence's (query) block into q=1 DECODE rows (see
+        // SpeculativeWorkerImpl::prepare_validate_inputs), so model the sweep
+        // point (batch_size, query_len, prefix_len) as a decode batch of
+        // batch_size*query_len rows, each attending prefix_len KV
+        // (total_length = prefix_len + 1). Pruning is gated off here because
+        // the predictor does not exist yet during profiling, so every row runs
+        // the full width and the recorded token count matches the sweep
+        // coordinate.
+        std::vector<int32_t> total_length_vec(static_cast<size_t>(rows),
+                                              prefix_len + 1);
         double latency_mean = 0.0;
         for (int32_t k = 0; k < profile_count_per_step_; ++k) {
-          latency_mean += run_request(token_length, prefix_len, batch_size);
+          latency_mean += run_decode_request(total_length_vec);
         }
         latency_mean /= static_cast<double>(profile_count_per_step_);
         LOG(INFO) << "[spec_validate_profile] batch=" << batch_size
