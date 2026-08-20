@@ -95,28 +95,11 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
       options.enable_profile_kv_blocks(), false /*is_prefill*/);
   speculative_validate_time_predictor_ = std::make_unique<TimePredictor>(
       options.enable_profile_kv_blocks(), false /*is_prefill*/);
-  if (options.enable_profile_step_time()) {
-    LOG(INFO) << "Starting profiliing step time.";
-    profile_step_time(false);
-    // The validate-time predictor is only consumed by the adaptive
-    // speculative controller, so skip the whole prefix/query/batch sweep
-    // unless adaptive speculative decode is actually enabled.
-    if (should_profile_speculative_validate()) {
-      profile_speculative_validate_time();
-    }
-    // test accuracy
-    // eval_sequence_latency_prediction();
-    // eval_batch_latency_prediction("only_prefill");
-    // eval_batch_latency_prediction("only_decode");
-    // eval_batch_latency_prediction("mix");
-  }
-  if (options.enable_profile_token_budget()) {
-    LOG(INFO) << "Starting profiliing token budget.";
-    profile_token_budget();
-  }
-  // more profile here, such as token_budget profile and decode length
-  // prediction.
 
+  // Warm up (capture graphs / prime eager operators) BEFORE profiling so the
+  // profile requests below are timed against the real, post-capture serving
+  // path. Otherwise the first profiled forwards would pay one-off lazy graph
+  // capture / operator compile cost and inflate the fitted predictors.
 #if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
   if (!is_rec_multi_round_mode()) {
     const auto& execution_config = ::xllm::ExecutionConfig::get_instance();
@@ -134,6 +117,29 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
     }
   }
 #endif
+
+  if (options.enable_profile_step_time()) {
+    LOG(INFO) << "Starting profiliing step time.";
+    profile_step_time(false);
+    // test accuracy
+    // eval_sequence_latency_prediction();
+    // eval_batch_latency_prediction("only_prefill");
+    // eval_batch_latency_prediction("only_decode");
+    // eval_batch_latency_prediction("mix");
+  }
+  // Decoupled from enable_profile_step_time: the validate-time predictor is
+  // consumed only by the adaptive speculative controller and is fit
+  // independently (own DECODE sweep + fit), so gate it solely on whether
+  // adaptive speculative decode is enabled.
+  if (should_profile_speculative_validate()) {
+    profile_speculative_validate_time();
+  }
+  if (options.enable_profile_token_budget()) {
+    LOG(INFO) << "Starting profiliing token budget.";
+    profile_token_budget();
+  }
+  // more profile here, such as token_budget profile and decode length
+  // prediction.
 }
 
 // --------------------- for test only ---------------------------
