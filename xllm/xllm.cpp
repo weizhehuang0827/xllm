@@ -173,6 +173,8 @@ Options create_options(const std::string& instance_name, bool is_local) {
           speculative_config.enable_adaptive_speculative_decode())
       .adaptive_speculative_min_gain(
           speculative_config.adaptive_speculative_min_gain())
+      .speculative_adaptive_cost_model(
+          speculative_config.speculative_adaptive_cost_model())
       .num_request_handling_threads(
           service_config.num_request_handling_threads())
       .communication_backend(parallel_config.communication_backend())

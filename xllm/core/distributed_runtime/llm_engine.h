@@ -64,8 +64,8 @@ class LLMEngine : public Engine {
   bool init(MasterStatus master_status) override;
 
   bool set_speculative_validate_time_predictor(
-      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor)
-      override;
+      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor,
+      const SpeculativeProfileRegistry::SpsCostTable& sps_table) override;
 
   void update_last_step_result(std::vector<Batch>& batch) override;
 

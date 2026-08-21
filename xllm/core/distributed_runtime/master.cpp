@@ -541,6 +541,8 @@ Master::Master(const Options& options, EngineType type)
         .enable_adaptive_speculative_decode(
             options_.enable_adaptive_speculative_decode())
         .adaptive_speculative_min_gain(options_.adaptive_speculative_min_gain())
+        .speculative_adaptive_cost_model(
+            options_.speculative_adaptive_cost_model())
         .task_type(options_.task_type())
         .enable_mla(options_.enable_mla())
         .npu_kernel_backend(options_.npu_kernel_backend())

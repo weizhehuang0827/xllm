@@ -170,8 +170,9 @@ bool SpeculativeEngine::allocate_kv_cache() {
 }
 
 bool SpeculativeEngine::set_speculative_validate_time_predictor(
-    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
-  return engine_->set_speculative_validate_time_predictor(predictor);
+    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor,
+    const SpeculativeProfileRegistry::SpsCostTable& sps_table) {
+  return engine_->set_speculative_validate_time_predictor(predictor, sps_table);
 }
 
 // TODO: support dp batches later

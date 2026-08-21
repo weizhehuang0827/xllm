@@ -48,8 +48,8 @@ class SpeculativeEngine : public Engine {
   const ModelArgs& model_args() const override { return model_args_; }
 
   bool set_speculative_validate_time_predictor(
-      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor)
-      override;
+      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor,
+      const SpeculativeProfileRegistry::SpsCostTable& sps_table) override;
 
   runtime::DecodeGraphExecutionShape decode_graph_execution_shape()
       const override;

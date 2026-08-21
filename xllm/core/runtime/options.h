@@ -90,6 +90,8 @@ struct Options {
 
   PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
 
+  PROPERTY(std::string, speculative_adaptive_cost_model) = "linear";
+
   // enable speculative decode
   PROPERTY(bool, enable_speculative_decode) = false;
 

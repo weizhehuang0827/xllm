@@ -24,6 +24,15 @@ limitations under the License.
 
 namespace xllm {
 
+// Cost model the controller optimizes when choosing per-seq validate widths.
+//   LINEAR: greedy, admit a draft while it improves
+//     (batch + expected_accepted) / fitted_linear_validate_time.
+//   SPS: goodput argmax, pick the batch-wide draft count k that maximizes
+//     (batch + expected_accepted_k) * steps_per_sec(batch + k) from a profiled
+//     steps-per-second table. Puts accepted-token throughput in the numerator,
+//     so it does not over-prune when the linear single-step objective would.
+enum class AdaptiveCostModel : int8_t { LINEAR = 0, SPS = 1 };
+
 // Decides per-seq speculative validate prefix lengths based on draft token
 // path probabilities and profiled validate time. Greedy algorithm: candidates
 // sorted by path_prob descending, accepted if estimated throughput improves.
@@ -49,6 +58,7 @@ class AdaptiveSpeculativeController final {
  private:
   bool enabled_ = false;
   double min_gain_ = 0.0;
+  AdaptiveCostModel cost_model_ = AdaptiveCostModel::LINEAR;
 };
 
 }  // namespace xllm

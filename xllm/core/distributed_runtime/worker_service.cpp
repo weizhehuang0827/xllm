@@ -500,8 +500,20 @@ void WorkerService::SetSpeculativeValidateTimePredictor(
     predictor.intercept_ms = request->intercept_ms();
     predictor.query_token_ms = request->query_token_ms();
     predictor.query_prefix_ms = request->query_prefix_ms();
+    SpeculativeProfileRegistry::SpsCostTable sps_table;
+    const int32_t sps_count =
+        std::min(request->sps_sample_batch_tokens_size(),
+                 request->sps_sample_steps_per_sec_size());
+    sps_table.sample_batch_tokens.reserve(sps_count);
+    sps_table.sample_steps_per_sec.reserve(sps_count);
+    for (int32_t i = 0; i < sps_count; ++i) {
+      sps_table.sample_batch_tokens.push_back(
+          request->sps_sample_batch_tokens(i));
+      sps_table.sample_steps_per_sec.push_back(
+          request->sps_sample_steps_per_sec(i));
+    }
     response->set_ok(
-        worker_->set_speculative_validate_time_predictor(predictor));
+        worker_->set_speculative_validate_time_predictor(predictor, sps_table));
   });
   return;
 }

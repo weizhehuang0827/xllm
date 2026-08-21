@@ -80,6 +80,13 @@ DEFINE_double(
     "Minimum relative throughput gain required to include a draft token in "
     "adaptive speculative validation.");
 
+DEFINE_string(
+    speculative_adaptive_cost_model,
+    "linear",
+    "Cost model for the adaptive speculative controller: 'linear' (fitted "
+    "linear validate-time predictor) or 'sps' (goodput via a profiled "
+    "steps-per-second lookup table).");
+
 namespace xllm {
 
 void SpeculativeConfig::from_flags() {
@@ -97,6 +104,7 @@ void SpeculativeConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_atb_spec_kernel);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_adaptive_speculative_decode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_speculative_min_gain);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(speculative_adaptive_cost_model);
 }
 
 void SpeculativeConfig::from_json(const JsonReader& json) {
@@ -114,6 +122,7 @@ void SpeculativeConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_atb_spec_kernel);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_adaptive_speculative_decode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_speculative_min_gain);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(speculative_adaptive_cost_model);
 }
 
 void SpeculativeConfig::append_config_json(
@@ -147,6 +156,8 @@ void SpeculativeConfig::append_config_json(
       config_json, default_config, enable_adaptive_speculative_decode);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, adaptive_speculative_min_gain);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, speculative_adaptive_cost_model);
 }
 
 SpeculativeConfig& SpeculativeConfig::get_instance() {

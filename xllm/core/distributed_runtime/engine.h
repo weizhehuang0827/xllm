@@ -59,7 +59,8 @@ class Engine {
   virtual const ModelArgs& model_args() const { return args_; }
 
   virtual bool set_speculative_validate_time_predictor(
-      const SpeculativeProfileRegistry::ValidateTimePredictor&) {
+      const SpeculativeProfileRegistry::ValidateTimePredictor&,
+      const SpeculativeProfileRegistry::SpsCostTable&) {
     return false;
   }
 

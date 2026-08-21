@@ -25,8 +25,11 @@ limitations under the License.
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <random>
 #include <sstream>
+#include <tuple>
+#include <vector>
 
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -61,6 +64,46 @@ int32_t decode_warmup_token_bucket(const DecodeGraphWarmupPlan& plan,
   return static_cast<int32_t>(runtime::get_decode_graph_token_bucket(
       num_token_rows,
       plan.execution_shape.enable_graph_mode_decode_no_padding));
+}
+
+// Assembles the goodput steps-per-second table from the same DECODE validate
+// sweep used to fit the linear predictor. Each sweep point (batch, query,
+// prefix, latency_ms) measured a decode step of batch*query rows, so it maps
+// to a probe (batch_tokens = batch*query, steps_per_sec = 1000/latency_ms).
+// Multiple sweep points can land on the same batch_tokens (e.g. 16x1 and 1x16);
+// their steps_per_sec are medianed so the table stays single-valued and robust
+// to a stray slow sample. The returned probes are sorted, strictly increasing
+// in batch_tokens, and drop any non-positive latency. Registry-side
+// sanitization repeats the finite/positive/monotone checks before commit.
+SpeculativeProfileRegistry::SpsCostTable build_sps_cost_table(
+    const std::vector<std::tuple<int32_t, int32_t, int32_t, double>>&
+        time_profiling_data) {
+  std::map<int32_t, std::vector<double>> steps_by_batch_tokens;
+  for (const auto& sample : time_profiling_data) {
+    const int32_t batch_size = std::get<0>(sample);
+    const int32_t query_len = std::get<1>(sample);
+    const double latency_ms = std::get<3>(sample);
+    if (batch_size <= 0 || query_len <= 0 || !std::isfinite(latency_ms) ||
+        latency_ms <= 0.0) {
+      continue;
+    }
+    const int32_t batch_tokens = batch_size * query_len;
+    steps_by_batch_tokens[batch_tokens].push_back(1000.0 / latency_ms);
+  }
+
+  SpeculativeProfileRegistry::SpsCostTable table;
+  table.sample_batch_tokens.reserve(steps_by_batch_tokens.size());
+  table.sample_steps_per_sec.reserve(steps_by_batch_tokens.size());
+  for (auto& [batch_tokens, steps] : steps_by_batch_tokens) {
+    std::sort(steps.begin(), steps.end());
+    const size_t mid = steps.size() / 2;
+    const double median = (steps.size() % 2 == 0)
+                              ? 0.5 * (steps[mid - 1] + steps[mid])
+                              : steps[mid];
+    table.sample_batch_tokens.push_back(batch_tokens);
+    table.sample_steps_per_sec.push_back(median);
+  }
+  return table;
 }
 
 }  // namespace
@@ -458,6 +501,21 @@ void ProfileManager::train_speculative_validate_time_predictor(
   predictor.intercept_ms = coefficients[0];
   predictor.query_token_ms = coefficients[1];
   predictor.query_prefix_ms = coefficients[2];
+  // The goodput cost table is derived from the same sweep so it commits in the
+  // same broadcast as the linear predictor. The registry keeps both; the
+  // adaptive controller reads whichever the --speculative_adaptive_cost_model
+  // flag selects. The linear predictor still gates the adaptive path either
+  // way, so the sps table is a pure add-on that never affects the gate.
+  const SpeculativeProfileRegistry::SpsCostTable sps_table =
+      build_sps_cost_table(time_profiling_data);
+  std::ostringstream sps_oss;
+  for (size_t i = 0; i < sps_table.sample_batch_tokens.size(); ++i) {
+    sps_oss << (i == 0 ? "" : ", ") << sps_table.sample_batch_tokens[i] << ":"
+            << sps_table.sample_steps_per_sec[i];
+  }
+  LOG(INFO)
+      << "Fitted speculative sps cost table (batch_tokens:steps_per_sec): "
+      << sps_oss.str();
   // Broadcast to workers FIRST, then commit locally. Workers gate the
   // adaptive path on their own SpeculativeProfileRegistry, so any rank
   // that misses the predictor will diverge from ranks that received it:
@@ -465,16 +523,18 @@ void ProfileManager::train_speculative_validate_time_predictor(
   // runs static, which corrupts collectives and shape assumptions.
   // Treat broadcast failure as fatal for the adaptive path and leave the
   // registry unset so every rank consistently falls back to static.
-  if (!engine_->set_speculative_validate_time_predictor(predictor)) {
+  if (!engine_->set_speculative_validate_time_predictor(predictor, sps_table)) {
     LOG(ERROR)
         << "Failed to broadcast speculative validate predictor to workers. "
         << "Disabling adaptive speculative decode on all ranks to avoid "
         << "cross-rank divergence.";
     SpeculativeProfileRegistry::get_instance().reset_validate_time_predictor();
+    SpeculativeProfileRegistry::get_instance().reset_sps_cost_table();
     return;
   }
   SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
       predictor);
+  SpeculativeProfileRegistry::get_instance().set_sps_cost_table(sps_table);
 }
 
 bool ProfileManager::should_profile_speculative_validate() const {
@@ -526,22 +586,39 @@ void ProfileManager::profile_speculative_validate_time() {
   // that real ceiling so query_token_ms is fit over the full range the
   // controller uses — capping it (e.g. at 10) forces the controller to
   // extrapolate the slope for large SL and inflates the coefficient.
+  //
+  // batch_tokens = batch_size * query_len is the axis the SPS goodput table
+  // keys on, and its argmax is sensitive to the shape of the sampled curve, so
+  // sweep both query_len and batch_size at quarter granularity (not just
+  // endpoints + midpoint) to give the SPS floor-probe table finer steps. The
+  // extra points also strengthen the shared linear fit; the only cost is a
+  // longer one-off profiling sweep at startup.
   const int32_t max_query_len = speculative_config.num_speculative_tokens() + 1;
   const int32_t max_batch_size =
       std::min<int32_t>(options_.max_seqs_per_batch(), 256);
   std::vector<int32_t> query_lens;
   query_lens.push_back(1);
-  if (max_query_len > 2) {
-    query_lens.push_back((max_query_len + 1) / 2);
+  // Quarter points: q in {ceil(M/4), ceil(M/2), ceil(3M/4), M}. De-duplicated
+  // below, so a small M collapses back toward the coarse {1, M/2, M} set.
+  for (int32_t part = 1; part <= 4; ++part) {
+    const int32_t q = (max_query_len * part + 3) / 4;
+    if (q > 1) {
+      query_lens.push_back(q);
+    }
   }
-  if (max_query_len > 1) {
-    query_lens.push_back(max_query_len);
-  }
+  std::sort(query_lens.begin(), query_lens.end());
   query_lens.erase(std::unique(query_lens.begin(), query_lens.end()),
                    query_lens.end());
 
+  // Small-dense, large-sparse batch grid (mirrors sglang's SPS profiler
+  // build_request_count_sweep, which steps 1,2,4,8 then coarsens): the
+  // steps_per_sec curve bends hardest at small batch_tokens, which is exactly
+  // where the goodput argmax is most sensitive, so sample it finely and let the
+  // near-linear tail be coarse. Capped at kMaxProfileBatchSize because this
+  // sweep runs on the startup path; a bench with max_seqs_per_batch<=32 sees
+  // its whole range covered.
   constexpr int32_t kMaxProfileBatchSize = 32;
-  std::vector<int32_t> candidate_batch_sizes = {1, 16, 32};
+  std::vector<int32_t> candidate_batch_sizes = {1, 2, 4, 8, 16, 24, 32};
   std::vector<int32_t> batch_sizes;
   for (const int32_t batch_size : candidate_batch_sizes) {
     if (batch_size <= max_batch_size && batch_size <= kMaxProfileBatchSize) {

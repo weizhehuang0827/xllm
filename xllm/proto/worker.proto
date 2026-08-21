@@ -64,6 +64,11 @@ message SpeculativeValidateTimePredictor {
   reserved 2;  // was: double batch_ms (dropped, dead field)
   double query_token_ms = 3;
   double query_prefix_ms = 4;
+  // Optional goodput cost table (only populated when the adaptive controller
+  // runs the sps cost model). Parallel arrays: sps_sample_batch_tokens is
+  // strictly increasing and the same length as sps_sample_steps_per_sec.
+  repeated int32 sps_sample_batch_tokens = 5;
+  repeated double sps_sample_steps_per_sec = 6;
 }
 
 message SleepRequest {

@@ -95,11 +95,18 @@ bool CommChannel::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
 }
 
 bool CommChannel::set_speculative_validate_time_predictor(
-    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
+    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor,
+    const SpeculativeProfileRegistry::SpsCostTable& sps_table) {
   proto::SpeculativeValidateTimePredictor request;
   request.set_intercept_ms(predictor.intercept_ms);
   request.set_query_token_ms(predictor.query_token_ms);
   request.set_query_prefix_ms(predictor.query_prefix_ms);
+  const size_t sps_count = std::min(sps_table.sample_batch_tokens.size(),
+                                    sps_table.sample_steps_per_sec.size());
+  for (size_t i = 0; i < sps_count; ++i) {
+    request.add_sps_sample_batch_tokens(sps_table.sample_batch_tokens[i]);
+    request.add_sps_sample_steps_per_sec(sps_table.sample_steps_per_sec[i]);
+  }
 
   proto::Status s;
   brpc::Controller cntl;

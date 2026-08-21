@@ -759,11 +759,12 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
 }
 
 bool LLMEngine::set_speculative_validate_time_predictor(
-    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
+    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor,
+    const SpeculativeProfileRegistry::SpsCostTable& sps_table) {
   bool success = true;
   for (size_t i = 0; i < worker_clients_.size(); ++i) {
     if (!worker_clients_[i]->set_speculative_validate_time_predictor(
-            predictor)) {
+            predictor, sps_table)) {
       LOG(ERROR) << "Failed to set speculative validate predictor for worker "
                  << i;
       success = false;

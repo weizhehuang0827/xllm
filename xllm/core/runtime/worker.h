@@ -72,7 +72,8 @@ class Worker {
   bool allocate_kv_cache(const KVCacheShape& kv_cache_shape);
 
   bool set_speculative_validate_time_predictor(
-      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor);
+      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor,
+      const SpeculativeProfileRegistry::SpsCostTable& sps_table);
 
   void get_cache_info(uint64_t& cluster_id, std::string& addr, uint16_t& port);
 

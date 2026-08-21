@@ -19,7 +19,10 @@ limitations under the License.
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
@@ -35,11 +38,41 @@ bool is_supported_algorithm(const std::string& algorithm) {
          SpeculativeConfig::is_block_diffusion_algorithm(algorithm);
 }
 
+AdaptiveCostModel parse_cost_model(const std::string& cost_model) {
+  if (cost_model == "sps") {
+    return AdaptiveCostModel::SPS;
+  }
+  if (cost_model != "linear") {
+    LOG(WARNING) << "Unknown speculative_adaptive_cost_model '" << cost_model
+                 << "', falling back to 'linear'.";
+  }
+  return AdaptiveCostModel::LINEAR;
+}
+
 struct PruneCandidate {
   int32_t seq_id = 0;
   int32_t prefix_len = 0;
   double path_prob = 0.0;
 };
+
+// Floor-probe lookup on a strictly-increasing batch_tokens axis: returns the
+// steps_per_sec of the largest probe whose batch_tokens is <= the query. This
+// is the C++ mirror of sglang's floor_probe_index (bisect_right - 1, clamped).
+double sps_lookup(const SpeculativeProfileRegistry::SpsCostTable& table,
+                  int32_t batch_tokens) {
+  const std::vector<int32_t>& probes = table.sample_batch_tokens;
+  CHECK(!probes.empty()) << "sps lookup on an empty cost table";
+  // upper_bound gives the first probe strictly greater than batch_tokens; the
+  // element before it is the floor. Clamp into [0, size-1] so queries below the
+  // smallest probe use the first entry and queries above the largest use the
+  // last.
+  auto it = std::upper_bound(probes.begin(), probes.end(), batch_tokens);
+  const int64_t idx =
+      std::clamp<int64_t>(std::distance(probes.begin(), it) - 1,
+                          0,
+                          static_cast<int64_t>(probes.size()) - 1);
+  return table.sample_steps_per_sec[static_cast<size_t>(idx)];
+}
 
 }  // namespace
 
@@ -55,7 +88,9 @@ AdaptiveSpeculativeController::AdaptiveSpeculativeController(
     : enabled_(options.enable_adaptive_speculative_decode() &&
                options.num_speculative_tokens() > 1 &&
                is_supported_algorithm(options.speculative_algorithm())),
-      min_gain_(options.adaptive_speculative_min_gain()) {}
+      min_gain_(options.adaptive_speculative_min_gain()),
+      cost_model_(parse_cost_model(options.speculative_adaptive_cost_model())) {
+}
 
 bool AdaptiveSpeculativeController::enabled() const { return enabled_; }
 
@@ -127,6 +162,45 @@ AdaptiveSpeculativeController::select_pruned_prefix_lengths(
               }
               return lhs.seq_id < rhs.seq_id;
             });
+
+  // SPS goodput path: pick the batch-wide draft count k that maximizes
+  //   theta(k) = tau_star(k) * steps_per_sec(batch_size + k)
+  // where tau_star(k) = batch_size + (sum of the k largest path_probs) is the
+  // expected accepted tokens per step (batch_size guaranteed anchors + expected
+  // accepted drafts) and (batch_size + k) is the total validate rows. Because
+  // path_prob is monotone non-increasing within a sequence, the k largest
+  // candidates always form a contiguous per-seq prefix, so admitting the top-k
+  // yields valid prefix_lengths (mirrors sglang compute_verify_token_budget).
+  // Falls back to the linear greedy below when the profiled table is missing
+  // (e.g. every probe was sanitized away).
+  std::optional<SpeculativeProfileRegistry::SpsCostTable> sps_table =
+      SpeculativeProfileRegistry::get_instance().sps_cost_table();
+  if (cost_model_ == AdaptiveCostModel::SPS && sps_table.has_value()) {
+    std::vector<int32_t> prefix_lengths(static_cast<size_t>(batch_size), 0);
+    // k = 0: prune all drafts, only the batch_size anchor rows are validated.
+    double best_theta =
+        static_cast<double>(batch_size) * sps_lookup(*sps_table, batch_size);
+    int32_t best_k = 0;
+    double running_accepted = 0.0;
+    for (size_t k = 1; k <= candidates.size(); ++k) {
+      running_accepted += candidates[k - 1].path_prob;
+      const double tau_star =
+          static_cast<double>(batch_size) + running_accepted;
+      const int32_t batch_tokens = batch_size + static_cast<int32_t>(k);
+      const double theta = tau_star * sps_lookup(*sps_table, batch_tokens);
+      if (theta > best_theta) {
+        best_theta = theta;
+        best_k = static_cast<int32_t>(k);
+      }
+    }
+    for (int32_t i = 0; i < best_k; ++i) {
+      const PruneCandidate& candidate = candidates[static_cast<size_t>(i)];
+      int32_t& prefix_len =
+          prefix_lengths[static_cast<size_t>(candidate.seq_id)];
+      prefix_len = std::max(prefix_len, candidate.prefix_len);
+    }
+    return prefix_lengths;
+  }
 
   // Incremental greedy: maintain running expected_accepted and validate_time
   // instead of recomputing the whole batch per candidate (was O(batch^2 * S)).

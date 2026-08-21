@@ -97,9 +97,13 @@ bool Worker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
 }
 
 bool Worker::set_speculative_validate_time_predictor(
-    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
+    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor,
+    const SpeculativeProfileRegistry::SpsCostTable& sps_table) {
   SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
       predictor);
+  // An empty table (linear cost model) is sanitized to a reset inside
+  // set_sps_cost_table, so has_sps_cost_table() stays false on those ranks.
+  SpeculativeProfileRegistry::get_instance().set_sps_cost_table(sps_table);
   return true;
 }
 

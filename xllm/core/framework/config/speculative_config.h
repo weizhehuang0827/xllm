@@ -84,7 +84,8 @@ class SpeculativeConfig final {
          "enable_mtp_draft_body_tp1",
          "enable_atb_spec_kernel",
          "enable_adaptive_speculative_decode",
-         "adaptive_speculative_min_gain"}};
+         "adaptive_speculative_min_gain",
+         "speculative_adaptive_cost_model"}};
     return kOptionCategory;
   }
 
@@ -115,6 +116,12 @@ class SpeculativeConfig final {
   PROPERTY(bool, enable_adaptive_speculative_decode) = false;
 
   PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
+
+  // Cost model the adaptive speculative controller uses to decide per-seq
+  // validate width: "linear" (default) weighs each draft against a fitted
+  // linear validate-time predictor; "sps" maximizes goodput (expected accepted
+  // tokens x steps/sec) via a profiled steps-per-second lookup table.
+  PROPERTY(std::string, speculative_adaptive_cost_model) = "linear";
 
  private:
   // ASCII case-insensitive equality. Mirrors the manual case handling in
